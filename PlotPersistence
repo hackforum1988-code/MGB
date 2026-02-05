@@ -1,6 +1,6 @@
 -- PlotPersistence.lua (ModuleScript in ServerScriptService)
 -- Speichert Gold + Brainrots pro Slot. StoredInSlot = slot.Name.
--- Überarbeitet: rekursive Prüfungen, defensive Restore, keine goto-Labels
+-- Überarbeitet: rekursive Prüfungen, defensive Restore, debug-Ausgaben hinter DEBUG-Flag
 
 local DataStoreService = game:GetService("DataStoreService")
 local Players = game:GetService("Players")
@@ -8,6 +8,10 @@ local RunService = game:GetService("RunService")
 local HttpService = game:GetService("HttpService")
 
 local PlotPersistence = {}
+
+-- Debug-Flag: auf true setzen, um alte Debug-prints wieder zu sehen
+local DEBUG = false
+
 local DATASTORE_NAME = "PlayerPlots_v1"
 local ds = nil
 
@@ -40,7 +44,7 @@ local function retryAsync(fn, retries)
 	return false, "max retries exceeded"
 end
 
--- Build payload
+-- BuildSaveForPlayer: sammelt Slots & Gold
 function PlotPersistence:BuildSaveForPlayer(player)
 	local out = { Plots = {}, Gold = 0, Updated = os.time() }
 
@@ -74,8 +78,10 @@ function PlotPersistence:BuildSaveForPlayer(player)
 					end
 
 					if isSlot then
-						-- DEBUG: show which slot we are scanning
-						print("DEBUG SaveScan: player=", player.Name, "plot=", plot.Name, "slot=", slot.Name)
+						-- DEBUG: kontrollierte Ausgabe
+						if DEBUG then
+							print("DEBUG SaveScan: player=", player.Name, "plot=", plot.Name, "slot=", slot.Name)
+						end
 
 						local brainrotsFolder = workspace:FindFirstChild("Brainrots")
 						local found = nil
@@ -84,38 +90,31 @@ function PlotPersistence:BuildSaveForPlayer(player)
 							for _, obj in ipairs(brainrotsFolder:GetDescendants()) do
 								if obj:IsA("Model") then
 									local storedTag = obj:FindFirstChild("StoredInSlot")
-									-- DEBUG: list brainrot candidate and its StoredInSlot if any
-									print("DEBUG SaveScan: candidate:", obj.Name, "parent:", obj.Parent and obj.Parent:GetFullName() or "nil", "StoredInSlot:", (storedTag and storedTag.Value) or "nil", "Owner:", (obj:FindFirstChild("Owner") and obj.Owner.Value) or "nil")
-									if storedTag and storedTag:IsA("StringValue") and storedTag.Value == slot.Name then
+									if storedTag and storedTag.Value == slot.Name then
+										-- Wir nehmen nur das erste gefundene Brainrot für diesen Slot
 										found = obj
+										if DEBUG then
+											print("DEBUG Found brainrot for slot:", slot.Name, " -> ", obj.Name)
+										end
 										break
 									end
 								end
 							end
 						end
 
+						-- Wenn gefunden, packe seine Metadaten ins Save-Payload
 						if found then
-							print("DEBUG SaveScan: MATCH found for slot", slot.Name, "->", found.Name, "storedTag:", found:FindFirstChild("StoredInSlot") and found.StoredInSlot.Value or "nil")
-							-- Defensive: only set slot entry once
-							if not plotData.Slots[slot.Name] then
-								local mining = found:FindFirstChild("MiningPower") and found.MiningPower.Value or nil
-								local rarity = found:FindFirstChild("Rarity") and found.Rarity.Value or nil
-								local price = found:FindFirstChild("Price") and found.Price.Value or nil
-								local income = found:FindFirstChild("IncomePerSec") and found.IncomePerSec.Value or nil
-
-								plotData.Slots[slot.Name] = {
-									ModelName = found.Name,
-									Rarity = rarity,
-									MiningPower = mining,
-									Price = price,
-									IncomePerSec = income,
-									StoredAt = slot.Name,
-								}
-							else
-								print("PlotPersistence: Warnung - doppelter Eintrag für", slot.Name, "übersprungen")
-							end
-						else
-							print("DEBUG SaveScan: NO match for slot", slot.Name)
+							local meta = {}
+							local mn = found:FindFirstChild("ModelName")
+							local rarity = found:FindFirstChild("Rarity")
+							local mining = found:FindFirstChild("MiningPower")
+							local income = found:FindFirstChild("IncomePerSec")
+							meta.ModelName = (mn and mn.Value) or found.Name
+							meta.Rarity = (rarity and rarity.Value) or (found:GetAttribute("Rarity") or "Common")
+							meta.MiningPower = (mining and tonumber(mining.Value)) or (found:GetAttribute("MiningPower") or 0)
+							meta.IncomePerSec = (income and tonumber(income.Value)) or (found:GetAttribute("IncomePerSec") or 0)
+							meta.StoredInSlot = slot.Name
+							plotData.Slots[slot.Name] = meta
 						end
 					end
 				end
@@ -125,157 +124,107 @@ function PlotPersistence:BuildSaveForPlayer(player)
 		end
 	end
 
-	local okEnc, summary = pcall(function()
-		return HttpService:JSONEncode({
-			Player = player.Name,
-			Gold = out.Gold,
-			HasPlots = (out.Plots and next(out.Plots) ~= nil),
-		})
-	end)
-	if okEnc then
-		print("PlotPersistence: BuildSaveForPlayer summary:", summary)
-	end
-
 	return out
 end
 
+-- SavePlayer: speichert Daten via DataStore (robust mit retry)
 function PlotPersistence:SavePlayer(player)
-	if not player or not player.UserId then return false, "invalid player" end
-	local key = "player_" .. tostring(player.UserId)
-	local payload = self:BuildSaveForPlayer(player)
-
-	-- DEBUG: print payload summary before saving
-	local okJson, payloadJson = pcall(function() return HttpService:JSONEncode(payload) end)
-	if okJson then
-		print("DEBUG SavePayload for", player.Name, payloadJson)
-	else
-		print("DEBUG SavePayload: could not encode payload for", player.Name)
-	end
-
-	local datastore = tryGetDataStore()
-	if not datastore then
-		warn("PlotPersistence: DataStore unavailable. Skipping save for", player.Name)
+	local ok, dsRef = pcall(tryGetDataStore)
+	if not ok or not dsRef then
+		warn("PlotPersistence: DataStore nicht verfügbar; Save übersprungen.")
 		return false, "datastore unavailable"
 	end
 
-	local ok, err = retryAsync(function()
-		return datastore:UpdateAsync(key, function(old)
-			if not old then
-				return payload
-			end
-			old.Plots = payload.Plots
-			old.Gold = payload.Gold
-			old.Updated = payload.Updated
-			return old
-		end)
-	end)
+	local payload = self:BuildSaveForPlayer(player)
+	local key = "player_" .. tostring(player.UserId)
 
-	if not ok then
-		warn("PlotPersistence: Save failed for", player.Name, err)
-		return false, err
+	local suc, res = retryAsync(function()
+		return dsRef:SetAsync(key, payload)
+	end, SAVE_RETRIES)
+
+	if not suc then
+		warn("PlotPersistence: Save fehlgeschlagen:", res)
+		return false, res
 	end
-	print("PlotPersistence: SavePlayer success for", player.Name)
+
+	if DEBUG then
+		print("PlotPersistence: Saved data for", player.Name)
+	end
 	return true
 end
 
-function PlotPersistence:LoadPlayer(player)
-	if not player or not player.UserId then return nil, "invalid player" end
-	local key = "player_" .. tostring(player.UserId)
-
-	local datastore = tryGetDataStore()
-	if not datastore then
-		warn("PlotPersistence: DataStore unavailable. Skipping load for", player.Name)
-		return nil, "datastore unavailable"
-	end
-
-	local success, data = retryAsync(function()
-		return datastore:GetAsync(key)
-	end)
-	if not success then
-		warn("PlotPersistence: Load failed for", player.Name)
-		return nil, "load failed"
-	end
-	print("PlotPersistence: LoadPlayer returned data for", player.Name, "hasPlots=", (data and data.Plots and next(data.Plots) ~= nil))
-	return data
-end
-
--- Robuste RestorePlayer ohne goto
+-- RestorePlayer: liest Daten und ruft callbacks zum Spawnen auf
+-- spawnCallback(plot, slotName, slotInfo) -> Model or nil
+-- startIncomeCallback(model)
 function PlotPersistence:RestorePlayer(player, spawnCallback, startIncomeCallback)
-	local data, err = self:LoadPlayer(player)
-	if not data then
-		return false, err
+	local ok, dsRef = pcall(tryGetDataStore)
+	if not ok or not dsRef then
+		warn("PlotPersistence: DataStore nicht verfügbar; Restore übersprungen.")
+		return false, "datastore unavailable"
 	end
 
-	if data.Gold and player and player:FindFirstChild("leaderstats") then
-		local goldVal = player.leaderstats:FindFirstChild("Gold")
-		if goldVal and goldVal:IsA("IntValue") then
-			pcall(function() goldVal.Value = tonumber(data.Gold) or goldVal.Value end)
+	local key = "player_" .. tostring(player.UserId)
+	local suc, data = retryAsync(function()
+		return dsRef:GetAsync(key)
+	end, SAVE_RETRIES)
+
+	if not suc then
+		-- Kein Save vorhanden oder Fehler
+		if DEBUG then
+			print("PlotPersistence: Kein Save oder Fehler beim Laden für", player.Name)
+		end
+		return false, "no data"
+	end
+
+	if not data or type(data) ~= "table" or not data.Plots then
+		if DEBUG then
+			print("PlotPersistence: Ungültige Save-Daten für", player.Name)
+		end
+		return false, "invalid data"
+	end
+
+	-- Stabile Restore-Logik: iteriere über gespeicherte Plots und Slots
+	local plotsFolder = workspace:FindFirstChild("Plots")
+	if not plotsFolder then
+		warn("PlotPersistence: workspace.Plots fehlt; Restore nicht möglich.")
+		return false, "no plots folder"
+	end
+
+	for plotName, plotData in pairs(data.Plots or {}) do
+		local plot = plotsFolder:FindFirstChild(plotName)
+		if plot then
+			for slotName, slotInfo in pairs(plotData.Slots or {}) do
+				local okSpawn, spawned = pcall(function()
+					return spawnCallback(plot, slotName, slotInfo)
+				end)
+				if okSpawn and spawned then
+					-- starte Einkommen (falls Callback vorhanden)
+					if startIncomeCallback then
+						pcall(function() startIncomeCallback(spawned) end)
+					end
+					if DEBUG then
+						print("PlotPersistence: Restored", slotInfo.ModelName, "into", plotName, slotName)
+					end
+				else
+					if DEBUG then
+						print("PlotPersistence: Spawn-Callback gab nil für", plotName, slotName)
+					end
+				end
+			end
+		else
+			if DEBUG then
+				print("PlotPersistence: Plot nicht gefunden beim Restore:", plotName)
+			end
 		end
 	end
 
-	if not data.Plots then return true end
-
-	for plotName, plotData in pairs(data.Plots) do
-		local plot = workspace:FindFirstChild("Plots") and workspace.Plots:FindFirstChild(plotName)
-		if plot then
-			plot:SetAttribute("Owner", player.Name)
-			for slotName, slotInfo in pairs(plotData.Slots or {}) do
-				if slotInfo and slotInfo.ModelName then
-					-- Defensive: skip if slot object is missing
-					local slotObj = plot:FindFirstChild(slotName)
-					if not slotObj then
-						print("PlotPersistence: Restore skip - Slot not found:", slotName, "in plot", plotName)
-						-- continue to next slot
-					else
-						-- Skip if slot already marked Occupied
-						local skipThisSlot = false
-						if slotObj.GetAttribute and slotObj:GetAttribute("Occupied") then
-							print("PlotPersistence: Restore skip - Slot Occupied attribute set:", slotName, "in plot", plotName)
-							skipThisSlot = true
-						end
-
-						-- Skip if any existing model already claims this slot (rekursiv)
-						if not skipThisSlot then
-							local brainrotsFolder = workspace:FindFirstChild("Brainrots")
-							if brainrotsFolder then
-								for _, obj in ipairs(brainrotsFolder:GetDescendants()) do
-									if obj:IsA("Model") then
-										local s = obj:FindFirstChild("StoredInSlot")
-										if s and s:IsA("StringValue") and s.Value == slotName then
-											print("PlotPersistence: Restore skip - existing model already stored in slot:", slotName, "in plot", plotName)
-											skipThisSlot = true
-											break
-										end
-									end
-								end
-							end
-						end
-
-						if not skipThisSlot then
-							-- Try to spawn via callback
-							local ok, modelOrErr = pcall(function()
-								return spawnCallback(plot, slotName, slotInfo)
-							end)
-							if ok and modelOrErr and startIncomeCallback then
-								-- Mark StoredInSlot and Occupied on the slot object
-								local s = modelOrErr:FindFirstChild("StoredInSlot") or Instance.new("StringValue")
-								s.Name = "StoredInSlot"
-								s.Value = slotName
-								s.Parent = modelOrErr
-
-								if slotObj.SetAttribute then
-									slotObj:SetAttribute("Occupied", true)
-								end
-
-								pcall(function() startIncomeCallback(modelOrErr) end)
-							else
-								if not ok then
-									warn("PlotPersistence: spawnCallback error for", player.Name, plotName, slotName, modelOrErr)
-								end
-							end
-						end
-					end
-				end
+	-- Gold wiederherstellen (sofern leaderstats vorhanden)
+	if data.Gold and player:FindFirstChild("leaderstats") then
+		local gold = player.leaderstats:FindFirstChild("Gold")
+		if gold and gold:IsA("IntValue") then
+			gold.Value = tonumber(data.Gold) or gold.Value
+			if DEBUG then
+				print("PlotPersistence: Gold restored for", player.Name, gold.Value)
 			end
 		end
 	end
