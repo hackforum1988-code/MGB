@@ -1,0 +1,338 @@
+-- RollSystem.lua (ServerScriptService)
+-- Model-aware RollSystem (labeling, template finder, spawn function)
+-- Exposes _G.spawnBrainrotModel for persistence bridge.
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local plotsFolder = workspace:WaitForChild("Plots")
+local ROLL_COST = 2 -- changed to 2 for testing
+local math_random = math.random
+
+local brainrotsFolder = workspace:FindFirstChild("Brainrots")
+if not brainrotsFolder then
+	brainrotsFolder = Instance.new("Folder")
+	brainrotsFolder.Name = "Brainrots"
+	brainrotsFolder.Parent = workspace
+end
+
+local modelsFolder = ReplicatedStorage:FindFirstChild("BrainrotModels")
+local workspaceModelsFolder = workspace:FindFirstChild("Brainrots") and workspace.Brainrots:FindFirstChild("Brainrot pack1")
+
+local PRICE_MULTIPLIER = 5
+
+-- Define MiningPower and IncomePerSec explicitly per definition for clarity
+local brainrotDefinitions = {
+	["Brr Brr Patapim"] = { ModelName = "Brr Brr Patapim", Rarity = "Common",    MiningPower = 1,  IncomePerSec = 1 },
+	["Boneca Ambalabu"] = { ModelName = "Boneca Ambalabu", Rarity = "Uncommon",  MiningPower = 3,  IncomePerSec = 2 },
+	["Cappuccino Assassino"] = { ModelName = "Cappuccino Assassino", Rarity = "Uncommon", MiningPower = 4, IncomePerSec = 2 },
+	["Cocofanto Elefanto"] = { ModelName = "Cocofanto Elefanto", Rarity = "Rare", MiningPower = 7, IncomePerSec = 4 },
+	["Crabbo Limonetta"] = { ModelName = "Crabbo Limonetta", Rarity = "Legendary", MiningPower = 12, IncomePerSec = 8 },
+	["Carloo"] = { ModelName = "Carloo", Rarity = "Mythic", MiningPower = 25, IncomePerSec = 20 },
+}
+
+local rarityWeights = {
+	Common = 60,
+	Uncommon = 25,
+	Rare = 10,
+	Legendary = 4,
+	Mythic = 1,
+}
+
+local rarityColors = {
+	Common    = Color3.fromRGB(200,200,200),
+	Uncommon  = Color3.fromRGB(100,220,120),
+	Rare      = Color3.fromRGB(100,160,255),
+	Legendary = Color3.fromRGB(255,180,60),
+	Mythic    = Color3.fromRGB(230,80,230),
+}
+
+local function pickRarityByWeight()
+	local total = 0
+	for _, w in pairs(rarityWeights) do total = total + w end
+	local pick = math_random(1, total)
+	local acc = 0
+	for r, w in pairs(rarityWeights) do
+		acc = acc + w
+		if pick <= acc then return r end
+	end
+	return "Common"
+end
+
+local function pickDefinitionByRarity(rarity)
+	local list = {}
+	for name, def in pairs(brainrotDefinitions) do
+		if def.Rarity == rarity then table.insert(list, {Name=name, Def=def}) end
+	end
+	if #list == 0 then return nil end
+	return list[math_random(1, #list)]
+end
+
+local function rollDefinition()
+	local rarity = pickRarityByWeight()
+	local picked = pickDefinitionByRarity(rarity)
+	if picked then return picked.Name, picked.Def end
+	for name, def in pairs(brainrotDefinitions) do return name, def end
+end
+
+local function getPlotPosition(plot)
+	local spawnPart = plot:FindFirstChild("BrainrotSpawn")
+	if spawnPart and spawnPart:IsA("BasePart") then
+		return spawnPart.Position + Vector3.new(0, 0.6, 0)
+	end
+	warn("⚠️ Plot " .. plot.Name .. " hat keinen BrainrotSpawn! Fallback wird verwendet.")
+	local playerSpawn = plot:FindFirstChild("Spawn")
+	if playerSpawn and playerSpawn:IsA("BasePart") then
+		return playerSpawn.Position + Vector3.new(0, 5, 0)
+	end
+	if plot.PrimaryPart then
+		return plot.PrimaryPart.Position + Vector3.new(0, 5, 0)
+	end
+	for _, c in ipairs(plot:GetDescendants()) do
+		if c:IsA("BasePart") then
+			return c.Position + Vector3.new(0, 5, 0)
+		end
+	end
+	return nil
+end
+
+local function findTemplate(modelName)
+	if modelsFolder then
+		local t = modelsFolder:FindFirstChild(modelName)
+		if t then return t end
+	end
+	if workspaceModelsFolder then
+		local t = workspaceModelsFolder:FindFirstChild(modelName)
+		if t then return t end
+	end
+	return nil
+end
+
+local function attachLabelToModel(model, displayName, rarityName, price, incomePerSec)
+	if not model then return end
+	local primary = model.PrimaryPart
+	if not primary then
+		for _, c in ipairs(model:GetDescendants()) do
+			if c:IsA("BasePart") then
+				model.PrimaryPart = c
+				primary = c
+				break
+			end
+		end
+	end
+	if not primary then return end
+
+	local old = primary:FindFirstChild("BrainrotLabel")
+	if old then old:Destroy() end
+
+	local size = model:GetExtentsSize()
+	local heightBoost = math.clamp(size.Y * 0.6, 3, 12)
+
+	local bb = Instance.new("BillboardGui")
+	bb.Name = "BrainrotLabel"
+	bb.Adornee = primary
+	bb.AlwaysOnTop = true
+	bb.Size = UDim2.new(0, 200, 0, 90)
+	bb.StudsOffset = Vector3.new(0, heightBoost, 0)
+	bb.MaxDistance = 150
+	bb.LightInfluence = 0
+	bb.Parent = primary
+
+	local localRarityColors = {
+		Common    = Color3.fromRGB(200,200,200),
+		Uncommon  = Color3.fromRGB(100,220,120),
+		Rare      = Color3.fromRGB(100,160,255),
+		Legendary = Color3.fromRGB(255,180,60),
+		Mythic    = Color3.fromRGB(230,80,230),
+	}
+
+	local function makeLine(text, order, color)
+		local lbl = Instance.new("TextLabel")
+		lbl.Size = UDim2.new(1, 0, 0, 18)
+		lbl.Position = UDim2.new(0, 0, 0, order * 18)
+		lbl.BackgroundTransparency = 1
+		lbl.Text = text
+		lbl.Font = Enum.Font.GothamBold
+		lbl.TextSize = 14
+		lbl.TextColor3 = color or Color3.fromRGB(255,255,255)
+		lbl.TextXAlignment = Enum.TextXAlignment.Center
+		lbl.Parent = bb
+
+		local stroke = Instance.new("UIStroke")
+		stroke.Thickness = 2
+		stroke.Color = Color3.fromRGB(0,0,0)
+		stroke.Parent = lbl
+	end
+
+	makeLine(tostring(rarityName), 0, localRarityColors[rarityName] or Color3.fromRGB(255,255,255))
+	makeLine(tostring(displayName), 1)
+	makeLine("Preis: " .. tostring(price), 2)
+	makeLine("Income: " .. tostring(incomePerSec) .. "/s", 3)
+end
+
+local function spawnBrainrotModel(modelName, displayName, def, ownerName, spawnPos)
+	local template = findTemplate(modelName)
+	if not template then
+		warn("RollSystem: Template fehlt:", modelName)
+		return nil
+	end
+
+	local clone = template:Clone()
+	clone.Name = displayName or template.Name
+
+	if not clone.PrimaryPart then
+		for _, c in ipairs(clone:GetDescendants()) do
+			if c:IsA("BasePart") then
+				clone.PrimaryPart = c
+				break
+			end
+		end
+	end
+	if not clone.PrimaryPart then
+		local p = Instance.new("Part")
+		p.Name = "Primary"
+		p.Size = Vector3.new(1,1,1)
+		p.Transparency = 1
+		p.CanCollide = false
+		p.Anchored = true
+		p.Parent = clone
+		clone.PrimaryPart = p
+	end
+
+	local finalPos = spawnPos + Vector3.new(0, 1.5, 0)
+	clone:SetPrimaryPartCFrame(CFrame.new(finalPos))
+
+	-- Use explicit values from definition (MiningPower, IncomePerSec)
+	local mining = def.MiningPower or 1
+	local price = math.floor(mining * PRICE_MULTIPLIER)
+	local income = def.IncomePerSec or math.max(1, math.floor(mining * 0.5))
+
+	local ownerVal = Instance.new("StringValue"); ownerVal.Name = "Owner"; ownerVal.Value = ownerName; ownerVal.Parent = clone
+	local powerVal = Instance.new("IntValue"); powerVal.Name = "MiningPower"; powerVal.Value = mining; powerVal.Parent = clone
+	local rarityVal = Instance.new("StringValue"); rarityVal.Name = "Rarity"; rarityVal.Value = def.Rarity or "Common"; rarityVal.Parent = clone
+	local priceVal = Instance.new("IntValue"); priceVal.Name = "Price"; priceVal.Value = price; priceVal.Parent = clone
+	local incomeVal = Instance.new("IntValue"); incomeVal.Name = "IncomePerSec"; incomeVal.Value = income; incomeVal.Parent = clone
+
+	clone.Parent = brainrotsFolder
+
+	local anchoredParts = {}
+	for _, p in ipairs(clone:GetDescendants()) do
+		if p:IsA("BasePart") then
+			anchoredParts[p] = p.Anchored
+			p.Anchored = true
+			p.CanCollide = true
+		end
+	end
+
+	task.spawn(function()
+		local parts = {}
+		for _, d in ipairs(clone:GetDescendants()) do
+			if d:IsA("BasePart") then
+				parts[#parts+1] = d
+			end
+		end
+		local orig = {}
+		for _, p in ipairs(parts) do orig[p] = p.Transparency; p.Transparency = 1 end
+
+		local steps = 8
+		for i = 1, steps do
+			local t = i / steps
+			for _, p in ipairs(parts) do
+				local o = orig[p] or 0
+				p.Transparency = o + (1 - o) * (1 - t)
+			end
+			task.wait(0.03)
+		end
+		for _, p in ipairs(parts) do p.Transparency = orig[p] or 0 end
+
+		task.wait(0.05)
+		for p, old in pairs(anchoredParts) do
+			if p and p.Parent then
+				p.Anchored = false
+			end
+		end
+	end)
+
+	attachLabelToModel(clone, displayName or clone.Name, def.Rarity or "Common", price, income)
+
+	return clone
+end
+
+-- Expose spawn function globally for persistence bridge
+_G.spawnBrainrotModel = spawnBrainrotModel
+
+print("🔍 RollSystem ready")
+
+for _, plot in ipairs(plotsFolder:GetChildren()) do
+	local rollButton = plot:FindFirstChild("RollButton") or plot:FindFirstChild("GachaButton", true)
+	if not rollButton then continue end
+
+	local cd = rollButton:FindFirstChildOfClass("ClickDetector")
+	if not cd then
+		warn("RollButton ohne ClickDetector:", plot.Name)
+		continue
+	end
+
+	local debounce = {}
+
+	cd.MouseClick:Connect(function(player)
+		if debounce[player.UserId] then return end
+		debounce[player.UserId] = true
+		task.delay(0.3, function() debounce[player.UserId] = nil end)
+
+		-- Play click sound (server-side) if available in ReplicatedStorage.Sounds.Click
+		local soundsFolder = ReplicatedStorage:FindFirstChild("Sounds")
+		if soundsFolder then
+			local clickSoundTemplate = soundsFolder:FindFirstChild("Click")
+			if clickSoundTemplate and clickSoundTemplate:IsA("Sound") then
+				local s = clickSoundTemplate:Clone()
+				s.Parent = rollButton
+				pcall(function() s:Play() end)
+				game:GetService("Debris"):AddItem(s, 2)
+			end
+		end
+
+		local owner = plot:GetAttribute("Owner")
+		if not owner or owner ~= player.Name then return end
+
+		local stats = player:FindFirstChild("leaderstats")
+		local gold = stats and stats:FindFirstChild("Gold")
+		if not gold or gold.Value < ROLL_COST then return end
+
+		gold.Value = gold.Value - ROLL_COST
+
+		local pos = getPlotPosition(plot)
+		if not pos then
+			warn("RollSystem: Keine gültige Spawn-Position für Plot " .. plot.Name)
+			return
+		end
+
+		for _, obj in ipairs(brainrotsFolder:GetChildren()) do
+			local part = obj:IsA("Model") and obj.PrimaryPart or obj
+			if part and part:IsA("BasePart") then
+				local o = obj:FindFirstChild("Owner")
+				local stored = obj:FindFirstChild("StoredInSlot")
+				if o and o.Value == player.Name and not stored then
+					if (part.Position - pos).Magnitude < 50 then
+						obj:Destroy()
+					end
+				end
+			end
+		end
+
+		local name, def = rollDefinition()
+		if not def then
+			warn("RollSystem: Keine Brainrot-Definition gefunden.")
+			return
+		end
+
+		local spawnPos = pos + Vector3.new(0, 0.5, 0)
+		local spawned = spawnBrainrotModel(def.ModelName, name, def, player.Name, spawnPos)
+		if spawned then
+			print("🎲 " .. player.Name .. " rolled " .. tostring(name) .. " [" .. tostring(def.Rarity) .. "] Power:" .. tostring(def.MiningPower))
+		else
+			warn("RollSystem: Spawn fehlgeschlagen für " .. tostring(name))
+		end
+	end)
+end
+
+print("✅ RollSystem live")
