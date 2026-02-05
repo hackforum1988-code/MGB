@@ -1,0 +1,39 @@
+-- InitRemoteEvents.lua (ServerScriptService)
+-- Erstellt frühzeitig die benötigten RemoteEvents in ReplicatedStorage,
+-- damit Clients beim Start zuverlässig darauf zugreifen können.
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local function ensureRemote(name)
+	local r = ReplicatedStorage:FindFirstChild(name)
+	if r and r:IsA("RemoteEvent") then
+		return r
+	end
+	local new = Instance.new("RemoteEvent")
+	new.Name = name
+	new.Parent = ReplicatedStorage
+	print("InitRemoteEvents: created RemoteEvent", name)
+	return new
+end
+
+-- Ensure both events exist immediately
+ensureRemote("BrainrotPickup")
+ensureRemote("BrainrotPlace")
+
+-- Optional: ensure BrainrotModels folder exists (used by RollSystem)
+if not ReplicatedStorage:FindFirstChild("BrainrotModels") then
+	local f = Instance.new("Folder")
+	f.Name = "BrainrotModels"
+	f.Parent = ReplicatedStorage
+	print("InitRemoteEvents: created placeholder ReplicatedStorage.BrainrotModels")
+end
+
+-- Optional: ensure Sounds folder exists
+if not ReplicatedStorage:FindFirstChild("Sounds") then
+	local s = Instance.new("Folder")
+	s.Name = "Sounds"
+	s.Parent = ReplicatedStorage
+	print("InitRemoteEvents: created placeholder ReplicatedStorage.Sounds")
+end
+
+print("InitRemoteEvents ready")
