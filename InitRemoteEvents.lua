@@ -36,9 +36,10 @@ end
 
 -- Ensure commonly-used remotes exist
 ensureRemoteEvent("BrainrotPickup")
-ensureRemoteEvent("BrainrotPlace")
-ensureRemoteEvent("EquipRequest")
-ensureRemoteEvent("EquipResponse")
+sureRemoteEvent("BrainrotPlace")
+sureRemoteEvent("EquipRequest")
+sureRemoteEvent("EquipResponse")
+sureRemoteEvent("BrainrotSell")
 
 -- If you use any RemoteFunctions, ensure them too, e.g.:
 -- ensureRemoteFunction("InventoryRequest")
