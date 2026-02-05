@@ -1,11 +1,12 @@
 -- RollSystem.lua (ServerScriptService)
--- Model-aware RollSystem (labeling, template finder, spawn function)
--- Exposes _G.spawnBrainrotModel for persistence bridge.
+-- Nutzt AssetCatalog als Quelle für Brainrot-Definitionen (Price/MiningPower/Income/Rarity)
+-- Fügt ProximityPrompt zum Kaufen hinzu (Client feuert BrainrotPickup mit Modelname)
+-- Exposes _G.spawnBrainrotModel für PersistenceInit
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local plotsFolder = workspace:WaitForChild("Plots")
-local ROLL_COST = 2 -- changed to 2 for testing
+local ROLL_COST = 2 -- testing value; bei Bedarf anpassen
 local math_random = math.random
 
 local brainrotsFolder = workspace:FindFirstChild("Brainrots")
@@ -18,24 +19,30 @@ end
 local modelsFolder = ReplicatedStorage:FindFirstChild("BrainrotModels")
 local workspaceModelsFolder = workspace:FindFirstChild("Brainrots") and workspace.Brainrots:FindFirstChild("Brainrot pack1")
 
-local PRICE_MULTIPLIER = 5
+local PRICE_MULTIPLIER = 5 -- Fallback, falls kein Price im Catalog
 
--- Define MiningPower and IncomePerSec explicitly per definition for clarity
-local brainrotDefinitions = {
-	["Brr Brr Patapim"] = { ModelName = "Brr Brr Patapim", Rarity = "Common",    MiningPower = 1,  IncomePerSec = 1 },
-	["Boneca Ambalabu"] = { ModelName = "Boneca Ambalabu", Rarity = "Uncommon",  MiningPower = 3,  IncomePerSec = 2 },
-	["Cappuccino Assassino"] = { ModelName = "Cappuccino Assassino", Rarity = "Uncommon", MiningPower = 4, IncomePerSec = 2 },
-	["Cocofanto Elefanto"] = { ModelName = "Cocofanto Elefanto", Rarity = "Rare", MiningPower = 7, IncomePerSec = 4 },
-	["Crabbo Limonetta"] = { ModelName = "Crabbo Limonetta", Rarity = "Legendary", MiningPower = 12, IncomePerSec = 8 },
-	["Carloo"] = { ModelName = "Carloo", Rarity = "Mythic", MiningPower = 25, IncomePerSec = 20 },
-}
+-- Single Source: AssetCatalog
+local Catalog = require(game.ServerScriptService:WaitForChild("AssetCatalog"))
+
+-- Definitions auf Basis des Catalog
+local brainrotDefinitions = {}
+for name, def in pairs(Catalog) do
+	brainrotDefinitions[name] = {
+		ModelName    = def.TemplateName or name,
+		DisplayName  = name,
+		Rarity       = def.Rarity or "Common",
+		MiningPower  = def.MiningPower or 1,
+		IncomePerSec = def.IncomePerSec or math.max(1, math.floor((def.MiningPower or 1) * 0.5)),
+		Price        = def.Price or math.floor((def.MiningPower or 1) * PRICE_MULTIPLIER),
+	}
+end
 
 local rarityWeights = {
-	Common = 60,
-	Uncommon = 25,
-	Rare = 10,
+	Common    = 60,
+	Uncommon  = 25,
+	Rare      = 10,
 	Legendary = 4,
-	Mythic = 1,
+	Mythic    = 1,
 }
 
 local rarityColors = {
@@ -48,11 +55,11 @@ local rarityColors = {
 
 local function pickRarityByWeight()
 	local total = 0
-	for _, w in pairs(rarityWeights) do total = total + w end
+	for _, w in pairs(rarityWeights) do total += w end
 	local pick = math_random(1, total)
 	local acc = 0
 	for r, w in pairs(rarityWeights) do
-		acc = acc + w
+		acc += w
 		if pick <= acc then return r end
 	end
 	return "Common"
@@ -61,7 +68,9 @@ end
 local function pickDefinitionByRarity(rarity)
 	local list = {}
 	for name, def in pairs(brainrotDefinitions) do
-		if def.Rarity == rarity then table.insert(list, {Name=name, Def=def}) end
+		if def.Rarity == rarity then
+			table.insert(list, { Name = name, Def = def })
+		end
 	end
 	if #list == 0 then return nil end
 	return list[math_random(1, #list)]
@@ -107,6 +116,36 @@ local function findTemplate(modelName)
 	return nil
 end
 
+local function ensurePrompt(model, def)
+	if not model then return end
+	local primary = model.PrimaryPart
+	if not primary then
+		for _, c in ipairs(model:GetDescendants()) do
+			if c:IsA("BasePart") then
+				model.PrimaryPart = c
+				primary = c
+				break
+			end
+		end
+	end
+	if not primary then return end
+
+	local prompt = primary:FindFirstChild("BrainrotPurchase")
+	if not prompt then
+		prompt = Instance.new("ProximityPrompt")
+		prompt.Name = "BrainrotPurchase"
+		prompt.ActionText = "Kaufen"
+		prompt.ObjectText = tostring(def.Price or 0) .. " Gold"
+		prompt.HoldDuration = 0.75
+		prompt.MaxActivationDistance = 12
+		prompt.RequiresLineOfSight = false
+		prompt.Exclusivity = Enum.ProximityPromptExclusivity.OnePerButton
+		prompt.Parent = primary
+	end
+	prompt:SetAttribute("ModelName", def.DisplayName or model.Name)
+	prompt.ObjectText = tostring(def.Price or 0) .. " Gold"
+end
+
 local function attachLabelToModel(model, displayName, rarityName, price, incomePerSec)
 	if not model then return end
 	local primary = model.PrimaryPart
@@ -137,14 +176,6 @@ local function attachLabelToModel(model, displayName, rarityName, price, incomeP
 	bb.LightInfluence = 0
 	bb.Parent = primary
 
-	local localRarityColors = {
-		Common    = Color3.fromRGB(200,200,200),
-		Uncommon  = Color3.fromRGB(100,220,120),
-		Rare      = Color3.fromRGB(100,160,255),
-		Legendary = Color3.fromRGB(255,180,60),
-		Mythic    = Color3.fromRGB(230,80,230),
-	}
-
 	local function makeLine(text, order, color)
 		local lbl = Instance.new("TextLabel")
 		lbl.Size = UDim2.new(1, 0, 0, 18)
@@ -163,7 +194,7 @@ local function attachLabelToModel(model, displayName, rarityName, price, incomeP
 		stroke.Parent = lbl
 	end
 
-	makeLine(tostring(rarityName), 0, localRarityColors[rarityName] or Color3.fromRGB(255,255,255))
+	makeLine(tostring(rarityName), 0, rarityColors[rarityName] or Color3.fromRGB(255,255,255))
 	makeLine(tostring(displayName), 1)
 	makeLine("Preis: " .. tostring(price), 2)
 	makeLine("Income: " .. tostring(incomePerSec) .. "/s", 3)
@@ -201,14 +232,14 @@ local function spawnBrainrotModel(modelName, displayName, def, ownerName, spawnP
 	local finalPos = spawnPos + Vector3.new(0, 1.5, 0)
 	clone:SetPrimaryPartCFrame(CFrame.new(finalPos))
 
-	-- Use explicit values from definition (MiningPower, IncomePerSec)
 	local mining = def.MiningPower or 1
-	local price = math.floor(mining * PRICE_MULTIPLIER)
+	local price = def.Price or math.floor(mining * PRICE_MULTIPLIER)
 	local income = def.IncomePerSec or math.max(1, math.floor(mining * 0.5))
+	local rarity = def.Rarity or "Common"
 
 	local ownerVal = Instance.new("StringValue"); ownerVal.Name = "Owner"; ownerVal.Value = ownerName; ownerVal.Parent = clone
 	local powerVal = Instance.new("IntValue"); powerVal.Name = "MiningPower"; powerVal.Value = mining; powerVal.Parent = clone
-	local rarityVal = Instance.new("StringValue"); rarityVal.Name = "Rarity"; rarityVal.Value = def.Rarity or "Common"; rarityVal.Parent = clone
+	local rarityVal = Instance.new("StringValue"); rarityVal.Name = "Rarity"; rarityVal.Value = rarity; rarityVal.Parent = clone
 	local priceVal = Instance.new("IntValue"); priceVal.Name = "Price"; priceVal.Value = price; priceVal.Parent = clone
 	local incomeVal = Instance.new("IntValue"); incomeVal.Name = "IncomePerSec"; incomeVal.Value = income; incomeVal.Parent = clone
 
@@ -227,7 +258,7 @@ local function spawnBrainrotModel(modelName, displayName, def, ownerName, spawnP
 		local parts = {}
 		for _, d in ipairs(clone:GetDescendants()) do
 			if d:IsA("BasePart") then
-				parts[#parts+1] = d
+				table.insert(parts, d)
 			end
 		end
 		local orig = {}
@@ -252,12 +283,13 @@ local function spawnBrainrotModel(modelName, displayName, def, ownerName, spawnP
 		end
 	end)
 
-	attachLabelToModel(clone, displayName or clone.Name, def.Rarity or "Common", price, income)
+	attachLabelToModel(clone, displayName or clone.Name, rarity, price, income)
+	ensurePrompt(clone, def)
 
 	return clone
 end
 
--- Expose spawn function globally for persistence bridge
+-- Expose für PersistenceInit
 _G.spawnBrainrotModel = spawnBrainrotModel
 
 print("🔍 RollSystem ready")
@@ -279,7 +311,7 @@ for _, plot in ipairs(plotsFolder:GetChildren()) do
 		debounce[player.UserId] = true
 		task.delay(0.3, function() debounce[player.UserId] = nil end)
 
-		-- Play click sound (server-side) if available in ReplicatedStorage.Sounds.Click
+		-- Klick-Sound
 		local soundsFolder = ReplicatedStorage:FindFirstChild("Sounds")
 		if soundsFolder then
 			local clickSoundTemplate = soundsFolder:FindFirstChild("Click")
@@ -328,7 +360,7 @@ for _, plot in ipairs(plotsFolder:GetChildren()) do
 		local spawnPos = pos + Vector3.new(0, 0.5, 0)
 		local spawned = spawnBrainrotModel(def.ModelName, name, def, player.Name, spawnPos)
 		if spawned then
-			print("🎲 " .. player.Name .. " rolled " .. tostring(name) .. " [" .. tostring(def.Rarity) .. "] Power:" .. tostring(def.MiningPower))
+			print("🎲 " .. player.Name .. " rolled " .. tostring(name) .. " [" .. tostring(def.Rarity or "Common") .. "] Power:" .. tostring(def.MiningPower))
 		else
 			warn("RollSystem: Spawn fehlgeschlagen für " .. tostring(name))
 		end
