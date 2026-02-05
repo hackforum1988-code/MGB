@@ -1,0 +1,466 @@
+-- BrainrotPickupServer.lua (ServerScriptService)
+-- Vollständige, robuste Version mit Inventory-Integration und standardisierten Client-Antworten
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerStorage = game:GetService("ServerStorage")
+local RunService = game:GetService("RunService")
+
+-- Module requires
+local Inventory = require(game.ServerScriptService:WaitForChild("InventoryServer"))
+local Catalog = require(game.ServerScriptService:WaitForChild("AssetCatalog"))
+
+-- Remotes (erzeugt falls nicht vorhanden)
+local function ensureRemote(name)
+	local r = ReplicatedStorage:FindFirstChild(name)
+	if not r then
+		r = Instance.new("RemoteEvent")
+		r.Name = name
+		r.Parent = ReplicatedStorage
+	end
+	return r
+end
+
+local pickupRemote = ensureRemote("BrainrotPickup")
+local placeRemote = ensureRemote("BrainrotPlace")
+local equipReq = ensureRemote("EquipRequest")
+local equipResp = ensureRemote("EquipResponse")
+
+-- Folders
+local brainrotsFolder = workspace:FindFirstChild("Brainrots")
+if not brainrotsFolder then
+	error("Brainrots folder missing in workspace")
+end
+
+local heldStorage = workspace:FindFirstChild("HeldBrainrots")
+if not heldStorage then
+	heldStorage = Instance.new("Folder")
+	heldStorage.Name = "HeldBrainrots"
+	heldStorage.Parent = workspace
+end
+
+-- State
+local heldByPlayer = {}      -- userId -> { model = Model, meta = metaTable, invIndex = number? }
+local activeIncome = {}      -- model -> income runner
+
+-- Cooldown to reduce rapid double-places
+local placeCooldown = {}
+local PLACE_COOLDOWN_SEC = 0.5
+
+-- Utility: store original transparencies/anchored states
+local function storeOriginalTransparencies(model)
+	local meta = { partOrigTransparency = {}, anchoredStates = {}, originalParent = model.Parent }
+	for _, p in ipairs(model:GetDescendants()) do
+		if p:IsA("BasePart") then
+			meta.partOrigTransparency[p] = p.Transparency or 0
+			meta.anchoredStates[p] = p.Anchored
+		end
+	end
+	return meta
+end
+
+local function restoreTransparenciesAndAnchors(meta)
+	if not meta then return false end
+	local ok = true
+	for part, orig in pairs(meta.partOrigTransparency or {}) do
+		if part and part.Parent then
+			local success, err = pcall(function() part.Transparency = orig or 0 end)
+			if not success then ok = false; warn("restore transparency failed:", err) end
+		end
+	end
+	for part, anchored in pairs(meta.anchoredStates or {}) do
+		if part and part.Parent then
+			local success, err = pcall(function() part.Anchored = anchored end)
+			if not success then ok = false; warn("restore anchored failed:", err) end
+		end
+	end
+	return ok
+end
+
+-- Income loop for placed models
+local function startIncomeForPlaced(model)
+	if not model or not model.Parent then return end
+	if activeIncome[model] then return end
+
+	local incomeValObj = model:FindFirstChild("IncomePerSec")
+	local ownerVal = model:FindFirstChild("Owner")
+	if not incomeValObj or not ownerVal then return end
+
+	local incomePerSec = tonumber(incomeValObj.Value) or 0
+	local ownerName = tostring(ownerVal.Value or "")
+
+	if incomePerSec <= 0 or ownerName == "" then return end
+
+	activeIncome[model] = { running = true }
+
+	task.spawn(function()
+		while activeIncome[model] and activeIncome[model].running do
+			if not model.Parent or not model:FindFirstChild("StoredInSlot") then
+				break
+			end
+
+			local player = Players:FindFirstChild(ownerName)
+			if not player then
+				for _, p in ipairs(Players:GetPlayers()) do
+					if p.Name == ownerName then
+						player = p
+						break
+					end
+				end
+			end
+
+			if player and player.Parent then
+				local leaderstats = player:FindFirstChild("leaderstats")
+				local gold = leaderstats and leaderstats:FindFirstChild("Gold")
+				if gold and gold:IsA("IntValue") then
+					pcall(function() gold.Value = gold.Value + math.floor(incomePerSec) end)
+				end
+			end
+
+			local waited = 0
+			while waited < 1 do
+				if not (activeIncome[model] and activeIncome[model].running) then break end
+				task.wait(0.1)
+				waited += 0.1
+			end
+		end
+		activeIncome[model] = nil
+	end)
+end
+
+_G.startIncomeForPlaced = startIncomeForPlaced
+
+-- Debug helper
+_G.DebugListHeld = function()
+	for k,v in pairs(heldByPlayer) do
+		print("heldByPlayer key:", k, "model:", v and v.model and v.model.Name or "nil", "parent:", v and v.model and v.model.Parent and v.model.Parent:GetFullName() or "nil", "invIndex:", v and v.invIndex or "nil")
+	end
+end
+
+-- Freigabe Occupied anhand StoredInSlot
+local function clearOccupiedForModel(model)
+	if not model then return end
+	local s = model:FindFirstChild("StoredInSlot")
+	if s and s.Value and s.Value ~= "" then
+		local plotsFolder = workspace:FindFirstChild("Plots")
+		if plotsFolder then
+			for _, plot in ipairs(plotsFolder:GetChildren()) do
+				local slotObj = plot:FindFirstChild(s.Value)
+				if slotObj and slotObj.SetAttribute then
+					slotObj:SetAttribute("Occupied", nil)
+					break
+				end
+			end
+		end
+	end
+end
+
+-- Helper: get player's plot object
+local function getPlayerPlot(player)
+	if not player then return nil end
+	local plotsFolder = workspace:FindFirstChild("Plots")
+	if not plotsFolder then return nil end
+	local plotName = player:GetAttribute("PlotName")
+	if not plotName then return nil end
+	return plotsFolder:FindFirstChild(plotName)
+end
+
+-- PICKUP handler: zwei Fälle
+--  A) Aufnahme eines bereits platzierten Modells
+--  B) Kauf/parkieren -> Inventory (metadaten) oder direkt parken wenn gewünscht
+pickupRemote.OnServerEvent:Connect(function(player, brainrot)
+	if not player or not player.Parent then return end
+
+	-- Wenn Spieler bereits etwas hält
+	if heldByPlayer[player.UserId] then
+		pickupRemote:FireClient(player, false, "Du hältst bereits ein Brainrot.")
+		return
+	end
+
+	-- Validierung
+	if not brainrot then
+		pickupRemote:FireClient(player, false, "Ungültiges Brainrot.")
+		return
+	end
+
+	-- FALL 1: Aufnahme eines bereits platzierten Modells (in Brainrots und hat StoredInSlot)
+	if brainrot:IsDescendantOf(brainrotsFolder) and brainrot:FindFirstChild("StoredInSlot") then
+		local owner = brainrot:FindFirstChild("Owner")
+		if not owner or owner.Value ~= player.Name then
+			pickupRemote:FireClient(player, false, "Nicht dein Brainrot.")
+			return
+		end
+
+		-- Occupied freigeben und StoredInSlot entfernen
+		local stored = brainrot:FindFirstChild("StoredInSlot")
+		if stored and stored.Value and stored.Value ~= "" then
+			local plotsFolder = workspace:FindFirstChild("Plots")
+			if plotsFolder then
+				for _, plot in ipairs(plotsFolder:GetChildren()) do
+					local slotObj = plot:FindFirstChild(stored.Value)
+					if slotObj and slotObj.SetAttribute then
+						slotObj:SetAttribute("Occupied", nil)
+						break
+					end
+				end
+			end
+			pcall(function() stored:Destroy() end)
+		end
+
+		-- Parken in HeldStorage (visuals transparent)
+		local meta = storeOriginalTransparencies(brainrot)
+		local okPark, parkErr = pcall(function()
+			for _, part in ipairs(brainrot:GetDescendants()) do
+				if part:IsA("BasePart") then
+					part.CanCollide = false
+					part.Anchored = true
+					part.Transparency = 1
+				end
+			end
+			brainrot.Parent = heldStorage
+		end)
+		if not okPark then
+			warn("Pickup: Fehler beim Parken:", parkErr)
+			pickupRemote:FireClient(player, false, "Aufnahme fehlgeschlagen.")
+			return
+		end
+
+		heldByPlayer[player.UserId] = { model = brainrot, meta = meta }
+		pickupRemote:FireClient(player, true, "pickedUp")
+		print(player.Name .. " picked up placed " .. brainrot.Name)
+		return
+	end
+
+	-- FALL 2: Kauf/parkieren (wir speichern in Inventory als Metadaten)
+	-- Prüfe, ob brainrot tatsächlich ein Template/Modelname ist (z.B. aus RollSystem)
+	local leaderstats = player:FindFirstChild("leaderstats")
+	local gold = leaderstats and leaderstats:FindFirstChild("Gold")
+	local miningPower = brainrot:FindFirstChild("MiningPower")
+	-- Wenn brainrot ist ein Template in ReplicatedStorage/ServerStorage, handle entsprechend
+	local def = Catalog[brainrot.Name] or {}
+	local cost = def.Price or (miningPower and miningPower.Value * 5) or 0
+
+	if not gold then
+		pickupRemote:FireClient(player, false, "Fehlende Daten.")
+		return
+	end
+	if gold.Value < cost then
+		pickupRemote:FireClient(player, false, "Brauchst " .. tostring(cost) .. " Gold!")
+		return
+	end
+
+	-- Bezahlen
+	gold.Value = gold.Value - cost
+
+	-- Erzeuge Inventory Item (Metadaten)
+	local item = {
+		ModelName = brainrot.Name,
+		TemplateName = def.TemplateName or brainrot.Name,
+		Price = cost,
+		MiningPower = def.MiningPower or (miningPower and miningPower.Value) or 0,
+		IncomePerSec = def.IncomePerSec or 0,
+	}
+	Inventory:AddToInventory(player, item)
+
+	-- Bestätige dem Client, dass Item im Inventory ist
+	pickupRemote:FireClient(player, true, "addedToInventory")
+	print("Inventory: added", item.ModelName, "for", player.Name)
+end)
+
+-- PLACE handler: platzieren eines gehaltenen Items in einen Slot
+placeRemote.OnServerEvent:Connect(function(player, slotParam)
+	if not player or not player.Parent then return end
+
+	-- Place cooldown
+	if placeCooldown[player.UserId] and tick() - placeCooldown[player.UserId] < PLACE_COOLDOWN_SEC then
+		placeRemote:FireClient(player, false, "Bitte kurz warten.")
+		return
+	end
+	placeCooldown[player.UserId] = tick()
+
+	local entry = heldByPlayer[player.UserId]
+	if not entry then
+		placeRemote:FireClient(player, false, "Du hältst nichts.")
+		return
+	end
+	local held = entry.model
+	if not held or not held.Parent then
+		placeRemote:FireClient(player, false, "Ungültiges gehaltenes Objekt.")
+		return
+	end
+
+	-- Resolve slot name
+	local slotName = nil
+	if typeof(slotParam) == "Instance" and slotParam.Name then
+		slotName = slotParam.Name
+	elseif typeof(slotParam) == "string" then
+		slotName = slotParam
+	end
+	if not slotName then
+		placeRemote:FireClient(player, false, "Ungültiger Slot.")
+		return
+	end
+
+	-- Find player's plot and slot
+	local plot = getPlayerPlot(player)
+	if not plot then
+		placeRemote:FireClient(player, false, "Plot nicht gefunden.")
+		return
+	end
+	local slot = plot:FindFirstChild(slotName)
+	if not slot then
+		placeRemote:FireClient(player, false, "Slot nicht gefunden auf deinem Plot.")
+		return
+	end
+
+	-- Atomare Sperre
+	if slot.SetAttribute then
+		if slot:GetAttribute("Occupied") then
+			placeRemote:FireClient(player, false, "Slot bereits belegt.")
+			return
+		end
+		slot:SetAttribute("Occupied", true)
+	end
+
+	-- Defensive: prüfe ob bereits ein Modell StoredInSlot == slotName existiert (rekursiv)
+	local brainrotsFolderRef = workspace:FindFirstChild("Brainrots")
+	if brainrotsFolderRef then
+		for _, existing in ipairs(brainrotsFolderRef:GetDescendants()) do
+			if existing:IsA("Model") then
+				local s = existing:FindFirstChild("StoredInSlot")
+				if s and s:IsA("StringValue") and s.Value == slotName then
+					if slot.SetAttribute then slot:SetAttribute("Occupied", nil) end
+					placeRemote:FireClient(player, false, "Slot bereits belegt.")
+					return
+				end
+				if existing.PrimaryPart and (existing.PrimaryPart.Position - slot.Position).Magnitude < 1.5 then
+					if slot.SetAttribute then slot:SetAttribute("Occupied", nil) end
+					placeRemote:FireClient(player, false, "Slot bereits belegt.")
+					return
+				end
+			end
+		end
+	end
+
+	-- Set StoredInSlot bevor wir bewegen
+	local storedTag = held:FindFirstChild("StoredInSlot") or Instance.new("StringValue")
+	storedTag.Name = "StoredInSlot"
+	storedTag.Value = slot.Name
+	storedTag.Parent = held
+
+	-- Move model into Brainrots and position it
+	local okMove, moveErr = pcall(function()
+		held.Parent = brainrotsFolder
+		if held:IsA("Model") and held.PrimaryPart then
+			held:SetPrimaryPartCFrame(CFrame.new(slot.Position + Vector3.new(0,3,0)))
+		elseif held:IsA("BasePart") then
+			held.Position = slot.Position + Vector3.new(0,3,0)
+		end
+	end)
+
+	if not okMove then
+		-- Revert: free occupied, destroy storedTag, try to park back in heldStorage and restore visuals
+		if slot and slot.SetAttribute then slot:SetAttribute("Occupied", nil) end
+		if storedTag and storedTag.Parent then pcall(function() storedTag:Destroy() end) end
+
+		local okRevert, revertErr = pcall(function()
+			held.Parent = heldStorage
+			restoreTransparenciesAndAnchors(entry.meta)
+		end)
+		if not okRevert then
+			warn("Place: Revert failed:", revertErr)
+		end
+
+		placeRemote:FireClient(player, false, "Platzieren fehlgeschlagen. Dein Brainrot wurde zurückgegeben.")
+		warn("BrainrotPickupServer: Fehler beim Platzieren:", moveErr)
+		return
+	end
+
+	-- finalize visuals and income
+	local okRestore = restoreTransparenciesAndAnchors(entry.meta)
+	if not okRestore then
+		for _, p in ipairs(held:GetDescendants()) do
+			if p:IsA("BasePart") then
+				pcall(function()
+					p.Transparency = 0
+					p.Anchored = true
+					p.CanCollide = true
+				end)
+			end
+		end
+	end
+
+	for _, p in ipairs(held:GetDescendants()) do
+		if p:IsA("BasePart") then
+			p.CanCollide = true
+			p.Anchored = true
+		end
+	end
+
+	-- Wenn dieses held entry eine invIndex hat, entferne das Item aus Inventory
+	if entry and entry.invIndex then
+		pcall(function() Inventory:RemoveFromInventory(player, entry.invIndex) end)
+	end
+
+	-- Jetzt erst heldByPlayer löschen (Operation erfolgreich abgeschlossen)
+	heldByPlayer[player.UserId] = nil
+
+	startIncomeForPlaced(held)
+
+	-- Save (PlotPersistence) falls vorhanden
+	local ok, mod = pcall(function() return require(script.Parent:WaitForChild("PlotPersistence")) end)
+	if ok and mod then
+		task.delay(0.25, function()
+			pcall(function() mod:SavePlayer(player) end)
+		end)
+	end
+
+	print("✅ " .. player.Name .. " placed " .. held.Name .. " in " .. slot.Name)
+	placeRemote:FireClient(player, true, held.Name)
+end)
+
+-- EquipRequest: spawn Template into HeldBrainrots and set heldByPlayer
+equipReq.OnServerEvent:Connect(function(player, inventoryIndex)
+	if not player or not player.Parent then return end
+	local inv = Inventory:GetInventory(player)
+	local item = inv and inv[inventoryIndex]
+	if not item then
+		equipResp:FireClient(player, false, "Kein Item an Index")
+		return
+	end
+
+	local template = ServerStorage:FindFirstChild(item.TemplateName) or ReplicatedStorage:FindFirstChild(item.TemplateName)
+	if not template then
+		equipResp:FireClient(player, false, "Template nicht gefunden")
+		return
+	end
+
+	local clone = template:Clone()
+	local ownerVal = Instance.new("StringValue"); ownerVal.Name = "Owner"; ownerVal.Value = player.Name; ownerVal.Parent = clone
+	clone.Parent = heldStorage
+
+	local meta = storeOriginalTransparencies(clone)
+	heldByPlayer[player.UserId] = { model = clone, meta = meta, invIndex = inventoryIndex }
+
+	equipResp:FireClient(player, true, clone.Name)
+end)
+
+-- PlayerRemoving: falls Spieler etwas hielt, parken/freigeben
+Players.PlayerRemoving:Connect(function(player)
+	local entry = heldByPlayer[player.UserId]
+	if entry and entry.model then
+		local model = entry.model
+		clearOccupiedForModel(model)
+		pcall(function()
+			model.Parent = brainrotsFolder
+			restoreTransparenciesAndAnchors(entry.meta)
+			for _, p in ipairs(model:GetDescendants()) do
+				if p:IsA("BasePart") then
+					p.CanCollide = true
+					p.Anchored = false
+				end
+			end
+		end)
+	end
+	heldByPlayer[player.UserId] = nil
+end)
