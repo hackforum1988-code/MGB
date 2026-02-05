@@ -1,0 +1,140 @@
+-- PersistenceInit.lua
+local Players = game:GetService("Players")
+local PlotPersistence = require(script.Parent:WaitForChild("PlotPersistence"))
+
+local function waitForCharacter(player)
+	local char = player.Character or player.CharacterAdded:Wait()
+	char:WaitForChild("HumanoidRootPart", 10)
+	return char
+end
+
+local function waitForPlot(player)
+	local timeout = 10
+	local t = 0
+	while t < timeout do
+		local plotName = player:GetAttribute("PlotName")
+		if plotName then
+			local plotsFolder = workspace:FindFirstChild("Plots")
+			if plotsFolder then
+				local plot = plotsFolder:FindFirstChild(plotName)
+				if plot then
+					return plot
+				end
+			end
+		end
+		task.wait(0.2)
+		t += 0.2
+	end
+	return nil
+end
+
+local function waitForSlots(plot)
+	local timeout = 10
+	local t = 0
+	while t < timeout do
+		for _, child in ipairs(plot:GetChildren()) do
+			if child.Name:match("Slot") or child:GetAttribute("IsSlot") or child:FindFirstChild("SlotMarker") then
+				return true
+			end
+		end
+		task.wait(0.2)
+		t += 0.2
+	end
+	return false
+end
+
+local function waitForSpawnFunction()
+	local timeout = 10
+	local t = 0
+	while t < timeout do
+		if type(_G.spawnBrainrotModel) == "function" then
+			return true
+		end
+		task.wait(0.2)
+		t += 0.2
+	end
+	return false
+end
+
+local function spawnCallback(plot, slotName, slotInfo)
+	if type(_G.spawnBrainrotModel) ~= "function" then
+		warn("PersistenceInit: _G.spawnBrainrotModel not available")
+		return nil
+	end
+
+	local slot = plot:FindFirstChild(slotName)
+	if not slot then
+		warn("PersistenceInit: Slot not found:", slotName, "in plot", plot.Name)
+		return nil
+	end
+
+	local spawnPos = slot.Position + Vector3.new(0, 3, 0)
+	local model = _G.spawnBrainrotModel(slotInfo.ModelName, slotInfo.ModelName, {
+		ModelName = slotInfo.ModelName,
+		Rarity = slotInfo.Rarity,
+		MiningPower = slotInfo.MiningPower,
+	}, plot:GetAttribute("Owner") or plot:GetAttribute("Owner"), spawnPos)
+
+	if model then
+		local s = model:FindFirstChild("StoredInSlot") or Instance.new("StringValue")
+		s.Name = "StoredInSlot"
+		s.Value = slotName
+		s.Parent = model
+	end
+
+	return model
+end
+
+local function startIncomeCallback(model)
+	if type(_G.startIncomeForPlaced) ~= "function" then
+		warn("PersistenceInit: _G.startIncomeForPlaced not available")
+		return
+	end
+	pcall(function() _G.startIncomeForPlaced(model) end)
+end
+
+Players.PlayerAdded:Connect(function(player)
+	player:WaitForChild("leaderstats", 10)
+	waitForCharacter(player)
+
+	local plot = waitForPlot(player)
+	if not plot then
+		warn("PersistenceInit: Plot not found for", player.Name)
+		return
+	end
+
+	waitForSlots(plot)
+	waitForSpawnFunction()
+
+	task.wait(0.5)
+	print("PersistenceInit: Starting safe restore for", player.Name)
+
+	local ok, err = pcall(function()
+		PlotPersistence:RestorePlayer(player, spawnCallback, startIncomeCallback)
+	end)
+
+	if not ok then
+		warn("PersistenceInit: Restore failed for", player.Name, err)
+	else
+		print("PersistenceInit: Restore completed for", player.Name)
+	end
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+	pcall(function()
+		PlotPersistence:SavePlayer(player)
+	end)
+end)
+
+print("PersistenceInit ready")
+
+-- Sicherer Autosave Starter
+-- Dieser Block steht bewusst ganz am Ende der Datei, außerhalb aller Connect-Handler.
+-- Er startet den globalen Autosave nur, wenn die Funktion vorhanden ist.
+local okPP, PPmod = pcall(function() return require(script.Parent:WaitForChild("PlotPersistence")) end)
+if okPP and PPmod and type(PPmod.StartGlobalAutosave) == "function" then
+	PPmod:StartGlobalAutosave(60) -- alle 60 Sekunden
+	print("PersistenceInit: Global autosave gestartet (60s)")
+else
+	warn("PersistenceInit: PlotPersistence nicht verfügbar oder StartGlobalAutosave fehlt")
+end
