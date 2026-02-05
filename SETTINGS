@@ -1,6 +1,3 @@
-LOKALES MODUL UNTER INVENTORY CONTROLLER
-
-
 local module = {OBJECTS = {}, SETTINGS = {}, slotAmount = 9}
 module.OBJECTS.HotBar = {}
 module.OBJECTS.Inventory = {}
