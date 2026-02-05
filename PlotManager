@@ -1,91 +1,159 @@
--- PlotManager.lua (ServerScriptService)
-local Players = game:GetService("Players")
-local plotsFolder = workspace:WaitForChild("Plots")
+-- PlotManagerAPI.lua (ModuleScript in ServerScriptService)
+-- Funktionen:
+--   PlaceInSlot(player, slotName, brainrotId) -> returns (true, reason?) on success
+--   RemoveFromSlot(player, slotName) -> returns (true, reason?) on success
+-- Hinweis: erwartet Slot-Parts unter workspace.Plots.<PlotName>.<SlotName>
+-- und ein ServerStorage.PurchasedBrainrots Folder (wird bei Bedarf erzeugt).
 
-local function getFreePlot()
-	for _, plot in ipairs(plotsFolder:GetChildren()) do
-		if not plot:GetAttribute("Taken") then
-			return plot
+local PlotManagerAPI = {}
+local ServerStorage = game:GetService("ServerStorage")
+local Workspace = game:GetService("Workspace")
+
+local PERSIST_MODULE_NAME = "PlotPersistence" -- sollte in ServerScriptService existieren
+local PURCHASE_ARCHIVE_FOLDER = "PurchasedBrainrots"
+
+local function dbg(...)
+	print("[PlotManagerAPI]", ...)
+end
+
+local function getPlayerPlot(player)
+	-- Versucht zuerst PlotName-Attribute am Player (wie PlotManager setzt)
+	local plotName = player:GetAttribute("PlotName")
+	if plotName and Workspace:FindFirstChild("Plots") then
+		local plot = Workspace.Plots:FindFirstChild(plotName)
+		if plot then return plot end
+	end
+	-- Fallback: suche Plot mit Owner==player.Name
+	if Workspace:FindFirstChild("Plots") then
+		for _, p in ipairs(Workspace.Plots:GetChildren()) do
+			if p:GetAttribute("Owner") == player.Name then
+				return p
+			end
 		end
 	end
 	return nil
 end
 
-local playerPlots = {}
+local function findSlotInPlayerPlot(player, slotName)
+	local plot = getPlayerPlot(player)
+	if not plot then return nil, "NoPlot" end
+	local slot = plot:FindFirstChild(slotName)
+	if not slot then return nil, "NoSuchSlot" end
+	return slot
+end
 
-Players.PlayerAdded:Connect(function(player)
-	print("👤 " .. player.Name .. " joined - searching for plot...")
-
-	if playerPlots[player.UserId] then
-		print("⚠️ Player already has a plot assigned:", player.Name)
-		return
-	end
-
-	local plot = getFreePlot()
-	if not plot then
-		warn("❌ No free plot for " .. player.Name)
-		return
-	end
-
-	plot:SetAttribute("Taken", true)
-	plot:SetAttribute("Owner", player.Name)
-	player:SetAttribute("PlotName", plot.Name)
-	playerPlots[player.UserId] = plot
-
-	print("✅ " .. player.Name .. " assigned plot: " .. plot.Name)
-
-	local charConn
-	charConn = player.CharacterAdded:Connect(function(char)
-		local hrp = char:WaitForChild("HumanoidRootPart", 10)
-		local spawnPart = plot:FindFirstChild("Spawn")
-		if hrp and spawnPart then
-			hrp.CFrame = spawnPart.CFrame + Vector3.new(0, 3, 0)
-			print("📍 " .. player.Name .. " spawned on " .. plot.Name)
-		else
-			warn("⚠️ Spawn part missing or HRP missing for " .. player.Name)
+local function findArchivedById(brainrotId)
+	local folder = ServerStorage:FindFirstChild(PURCHASE_ARCHIVE_FOLDER)
+	if not folder then return nil end
+	for _, child in ipairs(folder:GetChildren()) do
+		-- archived names may contain id suffix, or attribute BrainrotId
+		if child:GetAttribute("BrainrotId") == brainrotId then
+			return child
 		end
-	end)
-
-	player.AncestryChanged:Connect(function()
-		if not player:IsDescendantOf(game) then
-			if charConn then charConn:Disconnect() end
+		if tostring(child.Name):find(tostring(brainrotId)) then
+			return child
 		end
-	end)
-end)
-
-Players.PlayerRemoving:Connect(function(player)
-	print("👋 " .. player.Name .. " leaving - saving plot state and releasing plot")
-
-	-- 1) Save player state first
-	local ok, PlotPersistence = pcall(function() return require(script.Parent:WaitForChild("PlotPersistence")) end)
-	if ok and PlotPersistence then
-		local saved, err = pcall(function() return PlotPersistence:SavePlayer(player) end)
-		if saved then
-			print("PlotManager: SavePlayer completed for", player.Name)
-		else
-			warn("PlotManager: SavePlayer failed for", player.Name, err)
-		end
-	else
-		warn("PlotManager: Could not require PlotPersistence for saving")
 	end
+	return nil
+end
 
-	-- 2) Now release the plot
-	local plot = playerPlots[player.UserId]
-	if plot then
-		plot:SetAttribute("Taken", nil)
-		plot:SetAttribute("Owner", nil)
-		print("🔓 Plot " .. plot.Name .. " released")
-		playerPlots[player.UserId] = nil
-	else
-		for _, p in ipairs(plotsFolder:GetChildren()) do
-			if p:GetAttribute("Owner") == player.Name then
-				p:SetAttribute("Taken", nil)
-				p:SetAttribute("Owner", nil)
-				print("🔓 Plot " .. p.Name .. " released (fallback)")
-				break
+local function findWorkspaceBrainrotBySlot(plotSlot, player)
+	-- Suche in workspace.Brainrots nach einem Model mit StoredInSlot == slot.Name und Owner == player.Name
+	local brainrotsFolder = Workspace:FindFirstChild("Brainrots")
+	if not brainrotsFolder then return nil end
+	for _, obj in ipairs(brainrotsFolder:GetDescendants()) do
+		if obj:IsA("Model") then
+			local stored = obj:GetAttribute("StoredInSlot")
+			local owner = obj:GetAttribute("Owner")
+			if stored == plotSlot.Name and owner == player.Name then
+				return obj
 			end
 		end
 	end
-end)
+	return nil
+end
 
-print("🏗️ PlotManager ready")
+function PlotManagerAPI.PlaceInSlot(player, slotName, brainrotId)
+	-- Returns true on success, false + reason on fail
+	if not player then return false, "invalid player" end
+	local slot, err = findSlotInPlayerPlot(player, slotName)
+	if not slot then return false, err or "no slot" end
+
+	-- check if slot already occupied
+	local occupied = findWorkspaceBrainrotBySlot(slot, player)
+	if occupied then
+		return false, "slot occupied"
+	end
+
+	-- find archived model by id in ServerStorage.PurchasedBrainrots
+	local archived = findArchivedById(brainrotId)
+	if not archived then
+		return false, "archived brainrot not found"
+	end
+
+	-- clone archived into workspace.Brainrots as placed model
+	local brainrotsFolder = Workspace:FindFirstChild("Brainrots")
+	if not brainrotsFolder then
+		brainrotsFolder = Instance.new("Folder")
+		brainrotsFolder.Name = "Brainrots"
+		brainrotsFolder.Parent = Workspace
+	end
+
+	local placed = archived:Clone()
+	placed.Name = archived.Name -- keep name
+	placed.Parent = brainrotsFolder
+
+	-- set attributes so persistence sees it
+	placed:SetAttribute("StoredInSlot", slot.Name)
+	placed:SetAttribute("Owner", player.Name)
+	-- optionally clear Owned flag? Keep Owned = true to indicate purchased
+	placed:SetAttribute("Owned", true)
+	-- Position model at slot if slot is BasePart or has a placement marker
+	local slotPosPart = nil
+	if slot:IsA("BasePart") then slotPosPart = slot end
+	if not slotPosPart then
+		slotPosPart = slot:FindFirstChild("Placement") or slot:FindFirstChildWhichIsA("BasePart")
+	end
+	local modelPrimary = placed.PrimaryPart or (placed:FindFirstChildWhichIsA("BasePart"))
+	if modelPrimary and slotPosPart then
+		pcall(function()
+			modelPrimary.CFrame = slotPosPart.CFrame
+		end)
+	end
+
+	-- Save player data via PlotPersistence if available
+	local ok, PlotPersistence = pcall(function() return require(game.ServerScriptService:WaitForChild(PERSIST_MODULE_NAME)) end)
+	if ok and PlotPersistence and type(PlotPersistence.SavePlayer) == "function" then
+		pcall(function() PlotPersistence:SavePlayer(player) end)
+	end
+
+	dbg("Placed brainrot", placed.Name, "into", slot:GetFullName(), "for", player.Name)
+	return true
+end
+
+function PlotManagerAPI.RemoveFromSlot(player, slotName)
+	if not player then return false, "invalid player" end
+	local slot, err = findSlotInPlayerPlot(player, slotName)
+	if not slot then return false, err or "no slot" end
+
+	local model = findWorkspaceBrainrotBySlot(slot, player)
+	if not model then
+		return false, "no brainrot in slot"
+	end
+
+	-- clear stored attributes so PlotPersistence no longer reports it in that slot.
+	model:SetAttribute("StoredInSlot", nil)
+	-- keep owner / Owned state, as it belongs to player; we'll hand it back to player's inventory through pickup flow.
+	-- Optionally move to archive or keep in workspace for pickup flow. We'll keep it in workspace (pickup flow will handle giving tool).
+
+	-- Save persistence
+	local ok, PlotPersistence = pcall(function() return require(game.ServerScriptService:WaitForChild(PERSIST_MODULE_NAME)) end)
+	if ok and PlotPersistence and type(PlotPersistence.SavePlayer) == "function" then
+		pcall(function() PlotPersistence:SavePlayer(player) end)
+	end
+
+	dbg("Removed brainrot from slot", slotName, "for", player.Name)
+	return true
+end
+
+return PlotManagerAPI
