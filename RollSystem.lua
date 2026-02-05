@@ -5,6 +5,7 @@
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService = game:GetService("TweenService")
 local plotsFolder = workspace:WaitForChild("Plots")
 local ROLL_COST = 2 -- testing value; bei Bedarf anpassen
 local math_random = math.random
@@ -245,22 +246,18 @@ local function spawnBrainrotModel(modelName, displayName, def, ownerName, spawnP
 
 	clone.Parent = brainrotsFolder
 
-	local anchoredParts = {}
+	-- Alle Teile fixieren, collision aus, bleiben anchored, damit sie nicht verschoben werden
+	local parts = {}
 	for _, p in ipairs(clone:GetDescendants()) do
 		if p:IsA("BasePart") then
-			anchoredParts[p] = p.Anchored
 			p.Anchored = true
-			p.CanCollide = true
+			p.CanCollide = false
+			table.insert(parts, p)
 		end
 	end
 
+	-- sanfter Fade-In
 	task.spawn(function()
-		local parts = {}
-		for _, d in ipairs(clone:GetDescendants()) do
-			if d:IsA("BasePart") then
-				table.insert(parts, d)
-			end
-		end
 		local orig = {}
 		for _, p in ipairs(parts) do orig[p] = p.Transparency; p.Transparency = 1 end
 
@@ -274,13 +271,7 @@ local function spawnBrainrotModel(modelName, displayName, def, ownerName, spawnP
 			task.wait(0.03)
 		end
 		for _, p in ipairs(parts) do p.Transparency = orig[p] or 0 end
-
-		task.wait(0.05)
-		for p, old in pairs(anchoredParts) do
-			if p and p.Parent then
-				p.Anchored = false
-			end
-		end
+		-- Anchored/Collide-Einstellungen bleiben, damit kein Wegschubsen.
 	end)
 
 	attachLabelToModel(clone, displayName or clone.Name, rarity, price, income)
@@ -338,6 +329,7 @@ for _, plot in ipairs(plotsFolder:GetChildren()) do
 			return
 		end
 
+		-- Bestehende unplatzierte Brainrots im Plotbereich: Text/Prompt sofort weg, dann Fade-Out + Slide links
 		for _, obj in ipairs(brainrotsFolder:GetChildren()) do
 			local part = obj:IsA("Model") and obj.PrimaryPart or obj
 			if part and part:IsA("BasePart") then
@@ -345,7 +337,47 @@ for _, plot in ipairs(plotsFolder:GetChildren()) do
 				local stored = obj:FindFirstChild("StoredInSlot")
 				if o and o.Value == player.Name and not stored then
 					if (part.Position - pos).Magnitude < 50 then
-						obj:Destroy()
+						task.spawn(function()
+							-- HUD/Prompt sofort weg
+							if obj:IsA("Model") then
+								for _, d in ipairs(obj:GetDescendants()) do
+									if d:IsA("BillboardGui") then d:Destroy() end
+									if d:IsA("ProximityPrompt") then d.Enabled = false end
+								end
+							end
+
+							local dur = 0.5
+							local offset = Vector3.new(-3, 1.0, math.random(-1, 1))
+							-- fixieren, keine Kollision
+							if obj:IsA("Model") then
+								for _, bp in ipairs(obj:GetDescendants()) do
+									if bp:IsA("BasePart") then
+										bp.Anchored = true
+										bp.CanCollide = false
+									end
+								end
+							elseif part then
+								part.Anchored = true
+								part.CanCollide = false
+							end
+
+							if obj:IsA("Model") and obj.PrimaryPart then
+								local goalCFrame = obj.PrimaryPart.CFrame * CFrame.new(offset)
+								TweenService:Create(obj.PrimaryPart, TweenInfo.new(dur, Enum.EasingStyle.Sine, Enum.EasingDirection.Out), { CFrame = goalCFrame }):Play()
+							elseif part then
+								TweenService:Create(part, TweenInfo.new(dur, Enum.EasingStyle.Sine, Enum.EasingDirection.Out), { CFrame = part.CFrame * CFrame.new(offset) }):Play()
+							end
+							for _, bp in ipairs(obj:IsA("Model") and obj:GetDescendants() or {}) do
+								if bp:IsA("BasePart") then
+									TweenService:Create(bp, TweenInfo.new(dur, Enum.EasingStyle.Sine, Enum.EasingDirection.Out), { Transparency = 1 }):Play()
+								end
+							end
+							if not obj:IsA("Model") and part then
+								TweenService:Create(part, TweenInfo.new(dur, Enum.EasingStyle.Sine, Enum.EasingDirection.Out), { Transparency = 1 }):Play()
+							end
+							task.wait(dur)
+							pcall(function() obj:Destroy() end)
+						end)
 					end
 				end
 			end
