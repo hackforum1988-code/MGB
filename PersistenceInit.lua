@@ -1,5 +1,7 @@
 local Players = game:GetService("Players")
-local PlotPersistence = require(script.Parent:WaitForChild("PlotPersistence"))
+local RunService = game:GetService("RunService")
+
+local PlotPersistence = require(game.ServerScriptService:WaitForChild("PlotPersistence"))
 
 -- Debug-Flag
 local DEBUG = false
@@ -58,6 +60,33 @@ local function waitForSpawnFunction()
 	return false
 end
 
+local function normalizePlacedModel(model)
+	local hasPrompt = false
+	for _, pp in ipairs(model:GetDescendants()) do
+		if pp:IsA("ProximityPrompt") then
+			pp.ActionText = "Aufheben"
+			pp.ObjectText = model.Name
+			if pp.SetAttribute then pp:SetAttribute("Price", nil) end
+			hasPrompt = true
+		end
+		if pp:IsA("BasePart") then
+			pp.Anchored = true
+		end
+	end
+	if not hasPrompt then
+		local targetPart = model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart")
+		if targetPart then
+			local prompt = Instance.new("ProximityPrompt")
+			prompt.ActionText = "Aufheben"
+			prompt.ObjectText = model.Name
+			prompt.HoldDuration = 0
+			prompt.MaxActivationDistance = 10
+			prompt.RequiresLineOfSight = false
+			prompt.Parent = targetPart
+		end
+	end
+end
+
 local function spawnCallback(plot, slotName, slotInfo)
 	if type(_G.spawnBrainrotModel) ~= "function" then
 		warn("PersistenceInit: _G.spawnBrainrotModel not available")
@@ -82,6 +111,8 @@ local function spawnCallback(plot, slotName, slotInfo)
 		s.Name = "StoredInSlot"
 		s.Value = slotName
 		s.Parent = model
+
+		normalizePlacedModel(model)
 	end
 
 	return model
@@ -119,5 +150,18 @@ Players.PlayerAdded:Connect(function(player)
 
 	if not ok then
 		warn("PersistenceInit: Restore failed for", player.Name, err)
+	end
+end)
+
+-- Optional: On leave, save immediately
+Players.PlayerRemoving:Connect(function(player)
+	if DEBUG then
+		print("PersistenceInit: Saving player on leave", player.Name)
+	end
+	local ok, err = pcall(function()
+		PlotPersistence:SavePlayer(player)
+	end)
+	if not ok then
+		warn("PersistenceInit: Save failed for", player.Name, err)
 	end
 end)
