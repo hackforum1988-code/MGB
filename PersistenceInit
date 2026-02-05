@@ -1,6 +1,8 @@
--- PersistenceInit.lua
 local Players = game:GetService("Players")
 local PlotPersistence = require(script.Parent:WaitForChild("PlotPersistence"))
+
+-- Debug-Flag
+local DEBUG = false
 
 local function waitForCharacter(player)
 	local char = player.Character or player.CharacterAdded:Wait()
@@ -107,7 +109,9 @@ Players.PlayerAdded:Connect(function(player)
 	waitForSpawnFunction()
 
 	task.wait(0.5)
-	print("PersistenceInit: Starting safe restore for", player.Name)
+	if DEBUG then
+		print("PersistenceInit: Starting safe restore for", player.Name)
+	end
 
 	local ok, err = pcall(function()
 		PlotPersistence:RestorePlayer(player, spawnCallback, startIncomeCallback)
@@ -115,26 +119,5 @@ Players.PlayerAdded:Connect(function(player)
 
 	if not ok then
 		warn("PersistenceInit: Restore failed for", player.Name, err)
-	else
-		print("PersistenceInit: Restore completed for", player.Name)
 	end
 end)
-
-Players.PlayerRemoving:Connect(function(player)
-	pcall(function()
-		PlotPersistence:SavePlayer(player)
-	end)
-end)
-
-print("PersistenceInit ready")
-
--- Sicherer Autosave Starter
--- Dieser Block steht bewusst ganz am Ende der Datei, außerhalb aller Connect-Handler.
--- Er startet den globalen Autosave nur, wenn die Funktion vorhanden ist.
-local okPP, PPmod = pcall(function() return require(script.Parent:WaitForChild("PlotPersistence")) end)
-if okPP and PPmod and type(PPmod.StartGlobalAutosave) == "function" then
-	PPmod:StartGlobalAutosave(60) -- alle 60 Sekunden
-	print("PersistenceInit: Global autosave gestartet (60s)")
-else
-	warn("PersistenceInit: PlotPersistence nicht verfügbar oder StartGlobalAutosave fehlt")
-end
