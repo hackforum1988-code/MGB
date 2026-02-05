@@ -11,6 +11,9 @@ local RunService = game:GetService("RunService")
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
 
+-- Debug-Flag: setze auf true, um Test-Exports/Prints zu sehen
+local DEBUG = false
+
 -- Remotes
 local pickupRemote = ReplicatedStorage:WaitForChild("BrainrotPickup")
 local placeRemote = ReplicatedStorage:WaitForChild("BrainrotPlace")
@@ -43,20 +46,26 @@ local function clearLocalHeldVisuals()
 		-- If you spawned a client-only visual, destroy it here.
 		-- If the server spawns the real model in HeldBrainrots, you may only need to hide UI.
 		-- For safety, do not destroy server-owned instances.
-		print("clearLocalHeldVisuals: clearing client visuals")
+		if DEBUG then
+			print("clearLocalHeldVisuals: clearing client visuals")
+		end
 	end
 end
 
 local function restoreLocalHeldVisuals()
 	-- Restore any temporary UI/visuals if place failed
-	print("restoreLocalHeldVisuals: restoring client visuals")
+	if DEBUG then
+		print("restoreLocalHeldVisuals: restoring client visuals")
+	end
 end
 
 local function setLocalHeldModel(modelInstance)
 	-- Called when server confirms equip/pickup and provides a model name or instance
 	-- We store a reference for local UI logic; do not assume ownership of the instance.
 	localHeldModel = modelInstance
-	print("Local held model set to:", modelInstance and (modelInstance.Name or tostring(modelInstance)) or "nil")
+	if DEBUG then
+		print("Local held model set to:", modelInstance and (modelInstance.Name or tostring(modelInstance)) or "nil")
+	end
 end
 
 -- Robust pickup handler: supports new (boolean,payload) and legacy (Instance) formats
@@ -170,9 +179,9 @@ local function requestPlace(slotInstanceOrName)
 end
 
 -- Client -> Pickup request helper (call when player tries to pick up nearest brainrot)
-local function requestPickup(targetModel)
-	-- targetModel can be an Instance (nearest brainrot) or nil (server will validate)
-	pickupRemote:FireServer(targetModel)
+local function requestPickup(targetModelOrName)
+	-- targetModelOrName can be an Instance (nearest brainrot) or string modelName (to buy) or nil (server will validate)
+	pickupRemote:FireServer(targetModelOrName)
 end
 
 -- Client -> Equip request helper (equip item from inventory by index)
@@ -180,7 +189,7 @@ local function requestEquip(inventoryIndex)
 	equipReq:FireServer(inventoryIndex)
 end
 
--- Expose helpers to global for quick testing in Command Bar (optional)
+-- Expose helpers to global for compatibility with existing UI (original behavior)
 _G.Client_BrainrotHelpers = {
 	RequestPlace = requestPlace,
 	RequestPickup = requestPickup,
@@ -188,4 +197,8 @@ _G.Client_BrainrotHelpers = {
 	GetHeld = function() return localHeldModel end,
 }
 
-print("✅ BrainrotPickupClient ready (robust handlers)")
+if DEBUG then
+	print("✅ BrainrotPickupClient ready (robust handlers)")
+else
+	print("✅ BrainrotPickupClient ready (robust handlers)")
+end
