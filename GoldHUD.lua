@@ -3,9 +3,40 @@ local Players = game:GetService("Players")
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
 
--- Warte auf leaderstats (ohne kurzen Timeout, damit HUD nicht fehlschlägt)
+-- Warte auf leaderstats
 local leaderstats = player:WaitForChild("leaderstats")
 local goldValue = leaderstats:WaitForChild("Gold")
+
+-- Abkürzungen für große Zahlen
+local suffixes = {
+	{1e18, "Qi"},
+	{1e15, "Qa"},
+	{1e12, "T"},
+	{1e9,  "B"},
+	{1e6,  "M"},
+	{1e3,  "k"},
+}
+
+local function formatNumber(n)
+	if typeof(n) ~= "number" then
+		return tostring(n)
+	end
+	for _, entry in ipairs(suffixes) do
+		local div, suf = entry[1], entry[2]
+		if math.abs(n) >= div then
+			local v = n / div
+			-- max 3 signifikante Stellen, ohne unnötige Nullen
+			if math.abs(v) >= 100 then
+				return string.format("%.0f%s", v, suf)
+			elseif math.abs(v) >= 10 then
+				return string.format("%.1f%s", v, suf)
+			else
+				return string.format("%.2f%s", v, suf)
+			end
+		end
+	end
+	return tostring(n)
+end
 
 -- Erstelle ScreenGui
 local screenGui = Instance.new("ScreenGui")
@@ -42,7 +73,7 @@ amountLabel.Name = "GoldAmount"
 amountLabel.Size = UDim2.new(1, -60, 1, 0)
 amountLabel.Position = UDim2.new(0, 60, 0, 0)
 amountLabel.BackgroundTransparency = 1
-amountLabel.Text = tostring(goldValue.Value)
+amountLabel.Text = formatNumber(goldValue.Value)
 amountLabel.TextScaled = true
 amountLabel.Font = Enum.Font.GothamBold
 amountLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
@@ -64,7 +95,7 @@ smallLabel.Parent = hudFrame
 
 -- Update-Funktion
 local function updateAmount()
-	amountLabel.Text = tostring(goldValue.Value)
+	amountLabel.Text = formatNumber(goldValue.Value)
 end
 
 goldValue:GetPropertyChangedSignal("Value"):Connect(updateAmount)
@@ -75,8 +106,6 @@ goldValue.Changed:Connect(function()
 	pcall(function()
 		hudFrame:TweenSize(UDim2.new(0, 176, 0, 52), Enum.EasingDirection.Out, Enum.EasingStyle.Quad, 0.08, true)
 		task.wait(0.08)
-		hudFrame:TweenSize(UDim2.new(0, 160, 0, 48), Enum.EasingDirection.Out, Enum.EasingStyle.Quad, 0.12, true)
+		hudFrame:TweenSize(UDim2.new(0, 160, 0, 48), Enum.EasingDirection.Out, Enum.EasingStyle.Quad, 0.08, true)
 	end)
 end)
-
-print("✅ GoldHUD ready")
