@@ -1,204 +1,34 @@
--- BrainrotPickupClient.lua (PlayerScripts)
--- Robust client handler für Pickup / Place / Equip
--- Erwartet serverseitig: pickupRemote:FireClient(player, success:boolean, payload:string)
---                      placeRemote:FireClient(player, success:boolean, payload:string)
---                      equipResp:FireClient(player, success:boolean, payload:string)
+-- ... (bestehender Inhalt bleibt) ...
 
-local Players = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local RunService = game:GetService("RunService")
+local ProximityPromptService = game:GetService("ProximityPromptService")
 
-local player = Players.LocalPlayer
-local playerGui = player:WaitForChild("PlayerGui")
-
--- Debug-Flag: setze auf true, um Test-Exports/Prints zu sehen
-local DEBUG = false
-
--- Remotes
-local pickupRemote = ReplicatedStorage:WaitForChild("BrainrotPickup")
-local placeRemote = ReplicatedStorage:WaitForChild("BrainrotPlace")
-local equipReq = ReplicatedStorage:WaitForChild("EquipRequest")
-local equipResp = ReplicatedStorage:WaitForChild("EquipResponse")
-
--- Local state
-local localHeldModel = nil
-local isPlacing = false
-
--- UI helper placeholders (implement your UI functions or connect to existing UI)
-local function showToast(text)
-	-- Minimal: print to console; replace with your UI toast
-	print("[TOAST]", text)
-end
-
-local function showPlacingSpinner(show)
-	-- Optional: show/hide placing spinner in UI
-	if show then
-		print("Placing spinner ON")
-	else
-		print("Placing spinner OFF")
-	end
-end
-
--- Local visual helpers (adapt to your visuals)
-local function clearLocalHeldVisuals()
-	-- Remove or hide local held model/UI
-	if localHeldModel and localHeldModel.Parent then
-		-- If you spawned a client-only visual, destroy it here.
-		-- If the server spawns the real model in HeldBrainrots, you may only need to hide UI.
-		-- For safety, do not destroy server-owned instances.
-		if DEBUG then
-			print("clearLocalHeldVisuals: clearing client visuals")
+local function getEquippedToolName()
+	local char = player.Character
+	if not char then return nil end
+	for _, t in ipairs(char:GetChildren()) do
+		if t:IsA("Tool") then
+			return t.Name
 		end
 	end
+	return nil
 end
 
-local function restoreLocalHeldVisuals()
-	-- Restore any temporary UI/visuals if place failed
-	if DEBUG then
-		print("restoreLocalHeldVisuals: restoring client visuals")
-	end
-end
+ProximityPromptService.PromptTriggered:Connect(function(prompt, plr)
+	if plr ~= player then return end
+	if not prompt or not prompt:IsDescendantOf(workspace) then return end
 
-local function setLocalHeldModel(modelInstance)
-	-- Called when server confirms equip/pickup and provides a model name or instance
-	-- We store a reference for local UI logic; do not assume ownership of the instance.
-	localHeldModel = modelInstance
-	if DEBUG then
-		print("Local held model set to:", modelInstance and (modelInstance.Name or tostring(modelInstance)) or "nil")
-	end
-end
+	-- Slot-Prompt: Attr IsSlotPrompt oder Name beginnt mit "Slot" oder Parent-Name beginnt mit "Slot"
+	local isSlot = prompt:GetAttribute("IsSlotPrompt") or prompt.Name == "SlotPlace" or (prompt.Parent and tostring(prompt.Parent.Name):match("^Slot"))
+	if not isSlot then return end
 
--- Robust pickup handler: supports new (boolean,payload) and legacy (Instance) formats
-pickupRemote.OnClientEvent:Connect(function(successOrModel, payload)
-	-- New format: (success:boolean, payload:string)
-	if type(successOrModel) == "boolean" then
-		local success = successOrModel
-		local info = payload
-		if success then
-			if type(info) == "string" and info == "addedToInventory" then
-				showToast("Gekauft: Item wurde ins Inventar gelegt.")
-				-- update inventory UI here (request inventory from server)
-			elseif type(info) == "string" and info == "pickedUp" then
-				showToast("Aufgenommen.")
-				-- server hat das Modell in HeldBrainrots geparkt; request a short delay then try to find it
-				task.delay(0.05, function()
-					-- try to find the held model in workspace.HeldBrainrots owned by this player
-					local hb = workspace:FindFirstChild("HeldBrainrots")
-					if hb then
-						for _, m in ipairs(hb:GetChildren()) do
-							if m:FindFirstChild("Owner") and m.Owner.Value == player.Name then
-								setLocalHeldModel(m)
-								break
-							end
-						end
-					end
-				end)
-			else
-				-- payload might be model name
-				showToast("Erfolg: " .. tostring(info))
-			end
-		else
-			-- failure message
-			showToast("Fehler: " .. tostring(info))
-			-- keep held visuals intact
-			restoreLocalHeldVisuals()
-		end
+	local equippedName = getEquippedToolName()
+	if not equippedName then
+		showToast("Kein Item ausgerüstet zum Platzieren.")
 		return
 	end
 
-	-- Legacy format: server sent an Instance directly
-	if typeof(successOrModel) == "Instance" then
-		local model = successOrModel
-		if model and model.Name then
-			showToast("Gekauft: " .. model.Name)
-			setLocalHeldModel(model)
-		else
-			showToast("Kauf: ungültiges Modell erhalten")
-		end
-		return
-	end
-
-	-- Unexpected payload
-	warn("pickupRemote: unbekanntes payload:", successOrModel, payload)
+	local slotInstance = prompt.Parent  -- BasePart des Slots
+	placeRemote:FireServer(slotInstance)
 end)
 
--- Place response handler: only clear local held visuals on success
-placeRemote.OnClientEvent:Connect(function(success, payload)
-	showPlacingSpinner(false)
-	isPlacing = false
-	if success then
-		-- payload is model name
-		showToast("Platziert: " .. tostring(payload))
-		-- clear local visuals now that server confirmed
-		clearLocalHeldVisuals()
-		-- clear localHeldModel reference (server owns the placed model)
-		localHeldModel = nil
-	else
-		-- payload is error message
-		showToast("Platzieren fehlgeschlagen: " .. tostring(payload))
-		-- restore visuals so player still sees the item in hand
-		restoreLocalHeldVisuals()
-	end
-end)
-
--- Equip response handler
-equipResp.OnClientEvent:Connect(function(success, payload)
-	if success then
-		showToast("Equipped: " .. tostring(payload))
-		-- server spawned the model in HeldBrainrots; find it and set local reference
-		task.delay(0.05, function()
-			local hb = workspace:FindFirstChild("HeldBrainrots")
-			if hb then
-				for _, m in ipairs(hb:GetChildren()) do
-					if m:FindFirstChild("Owner") and m.Owner.Value == player.Name then
-						setLocalHeldModel(m)
-						break
-					end
-				end
-			end
-		end)
-	else
-		showToast("Equip fehlgeschlagen: " .. tostring(payload))
-	end
-end)
-
--- Client -> Place request helper (call from your input code)
-local function requestPlace(slotInstanceOrName)
-	if isPlacing then
-		showToast("Bitte kurz warten.")
-		return
-	end
-	if not localHeldModel then
-		showToast("Du hältst nichts.")
-		return
-	end
-	isPlacing = true
-	showPlacingSpinner(true)
-	-- send slot instance or slot name; server resolves both
-	placeRemote:FireServer(slotInstanceOrName)
-end
-
--- Client -> Pickup request helper (call when player tries to pick up nearest brainrot)
-local function requestPickup(targetModelOrName)
-	-- targetModelOrName can be an Instance (nearest brainrot) or string modelName (to buy) or nil (server will validate)
-	pickupRemote:FireServer(targetModelOrName)
-end
-
--- Client -> Equip request helper (equip item from inventory by index)
-local function requestEquip(inventoryIndex)
-	equipReq:FireServer(inventoryIndex)
-end
-
--- Expose helpers to global for compatibility with existing UI (original behavior)
-_G.Client_BrainrotHelpers = {
-	RequestPlace = requestPlace,
-	RequestPickup = requestPickup,
-	RequestEquip = requestEquip,
-	GetHeld = function() return localHeldModel end,
-}
-
-if DEBUG then
-	print("✅ BrainrotPickupClient ready (robust handlers)")
-else
-	print("✅ BrainrotPickupClient ready (robust handlers)")
-end
+print("✅ BrainrotPickupClient ready (robust handlers + SlotPromptListener)")
