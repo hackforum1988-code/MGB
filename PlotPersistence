@@ -12,7 +12,7 @@ local PlotPersistence = {}
 -- Debug-Flag: auf true setzen, um alte Debug-prints wieder zu sehen
 local DEBUG = false
 
-local DATASTORE_NAME = "PlayerPlots_v1"
+local DATASTORE_NAME = "PlayerPlots_v2"
 local ds = nil
 
 local function tryGetDataStore()
