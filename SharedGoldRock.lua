@@ -1,69 +1,22 @@
--- InitRemoteEvents.lua (ServerScriptService)
--- Erstellt frühzeitig die benötigten RemoteEvents in ReplicatedStorage,
--- damit Clients beim Start zuverlässig darauf zugreifen können.
+local Players = game:GetService("Players")
 
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local rock = workspace:WaitForChild("SharedGoldRock")
+local cd = rock:WaitForChild("ClickDetector")
 
-local DEBUG = false
+local PAYOUT = 5       -- Gold pro Klick
+local COOLDOWN = 0.3   -- Sekunden pro Spieler
+cd.MaxActivationDistance = 16
 
-local function ensureRemoteEvent(name)
-	local r = ReplicatedStorage:FindFirstChild(name)
-	if r and r:IsA("RemoteEvent") then
-		return r
+local debounce = {}
+
+cd.MouseClick:Connect(function(player)
+	if debounce[player.UserId] then return end
+	debounce[player.UserId] = true
+	task.delay(COOLDOWN, function() debounce[player.UserId] = nil end)
+
+	local stats = player:FindFirstChild("leaderstats")
+	local gold = stats and stats:FindFirstChild("Gold")
+	if gold then
+		gold.Value += PAYOUT
 	end
-	local new = Instance.new("RemoteEvent")
-	new.Name = name
-	new.Parent = ReplicatedStorage
-	if DEBUG then
-		print("InitRemoteEvents: created RemoteEvent", name)
-	end
-	return new
-end
-
-local function ensureRemoteFunction(name)
-	local r = ReplicatedStorage:FindFirstChild(name)
-	if r and r:IsA("RemoteFunction") then
-		return r
-	end
-	local new = Instance.new("RemoteFunction")
-	new.Name = name
-	new.Parent = ReplicatedStorage
-	if DEBUG then
-		print("InitRemoteEvents: created RemoteFunction", name)
-	end
-	return new
-end
-
--- Ensure commonly-used remotes exist
-ensureRemoteEvent("BrainrotPickup")
-ensureRemoteEvent("BrainrotPlace")
-ensureRemoteEvent("EquipRequest")
-ensureRemoteEvent("EquipResponse")
-ensureRemoteEvent("BrainrotSell")
-
--- If you use any RemoteFunctions, ensure them too, e.g.: 
--- ensureRemoteFunction("InventoryRequest")
-
--- Optional: ensure BrainrotModels folder exists (used by RollSystem)
-if not ReplicatedStorage:FindFirstChild("BrainrotModels") then
-	local f = Instance.new("Folder")
-	f.Name = "BrainrotModels"
-	f.Parent = ReplicatedStorage
-	if DEBUG then
-		print("InitRemoteEvents: created placeholder ReplicatedStorage.BrainrotModels")
-	end
-end
-
--- Optional: ensure Sounds folder exists
-if not ReplicatedStorage:FindFirstChild("Sounds") then
-	local s = Instance.new("Folder")
-	s.Name = "Sounds"
-	s.Parent = ReplicatedStorage
-	if DEBUG then
-		print("InitRemoteEvents: created placeholder ReplicatedStorage.Sounds")
-	end
-end
-
-if DEBUG then
-	print("InitRemoteEvents ready")
-end
+end)
