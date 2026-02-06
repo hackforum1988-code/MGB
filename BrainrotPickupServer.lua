@@ -1,23 +1,18 @@
--- BrainrotPickupServer.lua (ServerScriptService)
--- Platzieren: zuerst Tool im Character, sonst im Backpack; ankert platzierte Parts.
--- Platziert: ProximityPrompts auf "Aufheben" (kein Kaufen/0 Gold).
--- Label-Anzeige via attachLabelToModel (nach Platzieren).
+-- BrainrotPickupServer.lua (Server)
+-- Held-models are welded to player's hand server-side, but parts are Massless and non-collidable to avoid pushing the player.
+-- Robust detach & backpack-representation handling.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+local RunService = game:GetService("RunService")
 
 local DEBUG = true
-
-local Inventory = require(game.ServerScriptService:WaitForChild("InventoryServer"))
-local Catalog = require(game.ServerScriptService:WaitForChild("AssetCatalog"))
+local function dprint(...) if DEBUG then print("[BrainrotPickupServer]", ...) end end
 
 local function ensureRemote(name)
 	local r = ReplicatedStorage:FindFirstChild(name)
-	if not r then
-		r = Instance.new("RemoteEvent")
-		r.Name = name
-		r.Parent = ReplicatedStorage
-	end
+	if not r then r = Instance.new("RemoteEvent"); r.Name = name; r.Parent = ReplicatedStorage end
 	return r
 end
 
@@ -26,59 +21,32 @@ local placeRemote  = ensureRemote("BrainrotPlace")
 local equipReq     = ensureRemote("EquipRequest")
 local equipResp    = ensureRemote("EquipResponse")
 
-local brainrotsFolder = workspace:FindFirstChild("Brainrots")
-if not brainrotsFolder then
-	error("Brainrots folder missing in workspace")
+-- Inventory require (if any)
+local Inventory = nil
+local function tryRequireInventory()
+	local ok, mod = pcall(function()
+		local obj = game.ServerScriptService:FindFirstChild("InventoryServer")
+		if obj then return require(obj) end
+		return nil
+	end)
+	if ok and type(mod) == "table" then Inventory = mod; dprint("InventoryServer required"); return true end
+	return false
 end
+tryRequireInventory()
 
-local heldStorage = workspace:FindFirstChild("HeldBrainrots")
-if not heldStorage then
-	heldStorage = Instance.new("Folder")
-	heldStorage.Name = "HeldBrainrots"
-	heldStorage.Parent = workspace
-end
-
+-- Replicated templates
 local modelsFolder = ReplicatedStorage:FindFirstChild("BrainrotModels")
-local workspaceModelsFolder = workspace:FindFirstChild("Brainrots") and workspace.Brainrots:FindFirstChild("Brainrot pack1")
-
-local heldByPlayer = {}
-local activeIncome = {}
-local placeCooldown = {}
-local PLACE_COOLDOWN_SEC = 0.5
-
-local rarityColors = {
-	Common    = Color3.fromRGB(200,200,200),
-	Uncommon  = Color3.fromRGB(100,220,120),
-	Rare      = Color3.fromRGB(100,160,255),
-	Legendary = Color3.fromRGB(255,180,60),
-	Mythic    = Color3.fromRGB(230,80,230),
-}
-
-local function dprint(...) if DEBUG then print(...) end end
-
-local function safeSetAttribute(obj, name, value)
-	if obj and obj.SetAttribute then
-		local ok = pcall(function() obj:SetAttribute(name, value) end)
-		if ok then return end
-	end
-	local existing = obj and obj:FindFirstChild(name)
-	if existing and existing:IsA("ValueBase") then
-		existing.Value = value
-		return
-	end
-	local v
-	if typeof(value) == "number" then
-		v = Instance.new("NumberValue")
-	elseif typeof(value) == "boolean" then
-		v = Instance.new("BoolValue")
-	else
-		v = Instance.new("StringValue")
-	end
-	v.Name = name
-	v.Value = value
-	v.Parent = obj
+if not modelsFolder then
+	modelsFolder = Instance.new("Folder"); modelsFolder.Name = "BrainrotModels"; modelsFolder.Parent = ReplicatedStorage
 end
 
+local brainrotsFolder = Workspace:FindFirstChild("Brainrots")
+if not brainrotsFolder then brainrotsFolder = Instance.new("Folder"); brainrotsFolder.Name = "Brainrots"; brainrotsFolder.Parent = Workspace end
+
+local heldStorage = Workspace:FindFirstChild("HeldBrainrots")
+if not heldStorage then heldStorage = Instance.new("Folder"); heldStorage.Name = "HeldBrainrots"; heldStorage.Parent = Workspace end
+
+-- Helpers
 local function ensurePrimary(model)
 	if not model.PrimaryPart then
 		for _, c in ipairs(model:GetDescendants()) do
@@ -91,731 +59,439 @@ local function ensurePrimary(model)
 	return model.PrimaryPart
 end
 
-local function attachLabelToModel(model)
-	if not model then return end
-	local primary = ensurePrimary(model)
-	if not primary then return end
-
-	local old = primary:FindFirstChild("BrainrotLabel")
-	if old then old:Destroy() end
-
-	local size = model:GetExtentsSize()
-	local heightBoost = math.clamp(size.Y * 0.6, 3, 12)
-
-	local bb = Instance.new("BillboardGui")
-	bb.Name = "BrainrotLabel"
-	bb.Adornee = primary
-	bb.AlwaysOnTop = true
-	bb.Size = UDim2.new(0, 200, 0, 90)
-	bb.StudsOffset = Vector3.new(0, heightBoost, 0)
-	bb.MaxDistance = 400
-	bb.LightInfluence = 0
-	bb.Parent = primary
-
-	local rarityVal = model:FindFirstChild("Rarity")
-	local priceVal = model:FindFirstChild("Price")
-	local incomeVal = model:FindFirstChild("IncomePerSec")
-	local rarity = rarityVal and rarityVal.Value or "Common"
-	local price = priceVal and priceVal.Value or 0
-	local income = incomeVal and incomeVal.Value or 0
-	local displayName = model.Name
-
-	local function makeLine(text, order, color)
-		local lbl = Instance.new("TextLabel")
-		lbl.Size = UDim2.new(1, 0, 0, 18)
-		lbl.Position = UDim2.new(0, 0, 0, order * 18)
-		lbl.BackgroundTransparency = 1
-		lbl.Text = text
-		lbl.Font = Enum.Font.GothamBold
-		lbl.TextSize = 14
-		lbl.TextColor3 = color or Color3.fromRGB(255,255,255)
-		lbl.TextXAlignment = Enum.TextXAlignment.Center
-		lbl.Parent = bb
-
-		local stroke = Instance.new("UIStroke")
-		stroke.Thickness = 2
-		stroke.Color = Color3.fromRGB(0,0,0)
-		stroke.Parent = lbl
-	end
-
-	makeLine(tostring(rarity), 0, rarityColors[rarity] or Color3.fromRGB(255,255,255))
-	makeLine(tostring(displayName), 1)
-	makeLine("Preis: " .. tostring(price), 2)
-	makeLine("Income: " .. tostring(income) .. "/s", 3)
-end
-
-local function ensurePickupPrompt(model)
-	if not model then return end
-	local primary = ensurePrimary(model)
-	if not primary then return end
-	local prompt = nil
-	for _, d in ipairs(model:GetDescendants()) do
-		if d:IsA("ProximityPrompt") then
-			prompt = d
-			break
+local function setPartsMasslessAndNonCollide(model, flag)
+	-- flag = true -> set Massless = true and CanCollide = false
+	-- flag = false -> attempt to restore CanCollide = true and Massless = false
+	for _, p in ipairs(model:GetDescendants()) do
+		if p:IsA("BasePart") then
+			pcall(function()
+				if flag then
+					if p.SetNetworkOwner then p:SetNetworkOwner(nil) end
+					p.CanCollide = false
+				else
+					p.CanCollide = true
+				end
+			end)
+			pcall(function() p.Massless = (flag == true) end)
 		end
 	end
-	if not prompt then
-		prompt = Instance.new("ProximityPrompt")
-		prompt.Parent = primary
-	end
-	prompt.Enabled = true
-	prompt.ActionText = "Aufheben"
-	prompt.ObjectText = model.Name
-	prompt.KeyboardKeyCode = Enum.KeyCode.E
-	prompt.RequiresLineOfSight = false
-	prompt.HoldDuration = 0
-	prompt.MaxActivationDistance = 12
-	safeSetAttribute(prompt, "Price", nil)
-	safeSetAttribute(prompt, "ModelName", model:GetAttribute("ModelName") or model.Name)
-	return prompt
 end
 
-local function findTemplate(modelName)
-	if modelsFolder then
-		local t = modelsFolder:FindFirstChild(modelName)
-		if t then return t end
+local function anchorModel(model)
+	if not model then return end
+	for _, p in ipairs(model:GetDescendants()) do
+		if p:IsA("BasePart") then
+			pcall(function() p.Anchored = true; p.CanCollide = true end)
+			pcall(function() if p.SetNetworkOwner then p:SetNetworkOwner(nil) end end)
+		end
 	end
-	if workspaceModelsFolder then
-		local t = workspaceModelsFolder:FindFirstChild(modelName)
-		if t then return t end
-	end
-	return nil
 end
 
-local function spawnFromCatalog(modelName, ownerName)
-	local def = Catalog[modelName]
-	if not def then dprint("spawnFromCatalog: no def for", modelName) return nil end
-	local template = findTemplate(def.TemplateName or modelName)
-	if not template then
-		warn("spawnFromCatalog: Template fehlt für", modelName)
-		return nil
+local function unanchorAndGiveNetworkToPlayer(model, player)
+	if not model or not player then return end
+	for _, p in ipairs(model:GetDescendants()) do
+		if p:IsA("BasePart") then
+			pcall(function() p.Anchored = false; p.CanCollide = false end)
+			pcall(function() if p.SetNetworkOwner then p:SetNetworkOwner(player) end end)
+		end
 	end
+end
+
+local function removeWeldsFromPrim(prim)
+	for _, child in ipairs(prim:GetChildren()) do
+		if child:IsA("WeldConstraint") or child:IsA("Motor6D") then
+			pcall(function() child:Destroy() end)
+		end
+	end
+end
+
+local function attachModelToCharacter(model, player)
+	if not model or not player then return end
+	local char = player.Character
+	if not char then return end
+
+	local targetPart = char:FindFirstChild("RightHand") or char:FindFirstChild("Right Arm") or char:FindFirstChild("HumanoidRootPart")
+	if not targetPart then return end
+
+	local prim = ensurePrimary(model)
+	if not prim then return end
+
+	-- Make parts massless/non-collidable so they won't push the player
+	setPartsMasslessAndNonCollide(model, true)
+
+	-- Position once
+	local offset = CFrame.new(0, -0.5, -0.5) * CFrame.Angles(0, math.rad(180), 0)
+	pcall(function() prim.CFrame = targetPart.CFrame * offset end)
+
+	-- remove existing welds on prim
+	removeWeldsFromPrim(prim)
+
+	-- Create a weld between prim and the targetPart to keep it stably attached server-side
+	local weld = Instance.new("WeldConstraint")
+	weld.Part0 = prim
+	weld.Part1 = targetPart
+	weld.Parent = prim
+
+	-- mark model as held
+	pcall(function() model:SetAttribute("HeldBy", player.Name) end)
+
+	dprint("Attached model", model.Name, "to", player.Name, "hand with weld")
+end
+
+local function detachModelFromCharacter(model)
+	if not model then return end
+	-- remove welds
+	local prim = ensurePrimary(model)
+	if prim then
+		removeWeldsFromPrim(prim)
+	end
+	-- restore networkOwner nil and allow collisions after a short delay
+	for _, p in ipairs(model:GetDescendants()) do
+		if p:IsA("BasePart") then
+			pcall(function() if p.SetNetworkOwner then p:SetNetworkOwner(nil) end end)
+			pcall(function() p.CanCollide = false end) -- keep false until placed (avoid immediate physics)
+			pcall(function() p.Massless = true end)    -- keep massless to avoid sudden shove, will fully restore on placement
+		end
+	end
+	pcall(function() model:SetAttribute("HeldBy", nil) end)
+end
+
+-- Tool/backpack helpers
+local function backpackHasModel(player, modelName)
+	local back = player:FindFirstChild("Backpack")
+	if not back then return false end
+	for _, t in ipairs(back:GetChildren()) do
+		if t:IsA("Tool") then
+			local mn = nil
+			pcall(function() mn = (t.GetAttribute and (t:GetAttribute("ModelName") or t.Name)) or t.Name end)
+			if mn == modelName or t.Name == modelName then return true end
+		end
+	end
+	return false
+end
+
+local function giveToolToBackpack(player, item)
+	if not player or type(item) ~= "table" then return nil end
+	local back = player:FindFirstChild("Backpack") or player:WaitForChild("Backpack", 5)
+	if not back then return nil end
+	local modelName = item.ModelName or item.Model or item.Name or "Item"
+	if backpackHasModel(player, modelName) then return nil end
+	local tool = Instance.new("Tool")
+	tool.Name = modelName
+	tool.RequiresHandle = false
+	tool.CanBeDropped = false
+	pcall(function() tool:SetAttribute("ModelName", modelName) end)
+	pcall(function() tool:SetAttribute("amount", item.Amount or item.amount or 1) end)
+	pcall(function() tool:SetAttribute("IncomePerSec", item.IncomePerSec or item.incomePerSec or 0) end)
+	tool.Parent = back
+	dprint("gave Tool to backpack for", player.Name, "->", tool.Name)
+	return tool
+end
+
+local function dumpBackpackContents(player)
+	local back = player:FindFirstChild("Backpack")
+	if not back then return "(no backpack)" end
+	local parts = {}
+	for _, t in ipairs(back:GetChildren()) do
+		if t:IsA("Tool") then
+			local mn = nil
+			pcall(function() mn = (t.GetAttribute and (t:GetAttribute("ModelName") or t.Name)) or t.Name end)
+			table.insert(parts, tostring(t.Name) .. "[ModelName=" .. tostring(mn) .. "]")
+		end
+	end
+	return table.concat(parts, " | ")
+end
+
+local function spawnModelByName(modelName, ownerName, spawnCFrame)
+	local folder = ReplicatedStorage:FindFirstChild("BrainrotModels")
+	if not folder then return nil end
+	local template = folder:FindFirstChild(modelName)
+	if not template or not template:IsA("Model") then return nil end
 	local clone = template:Clone()
-	clone.Name = def.TemplateName or modelName
-
-	if not clone.PrimaryPart then
-		for _, c in ipairs(clone:GetDescendants()) do
-			if c:IsA("BasePart") then
-				clone.PrimaryPart = c
-				break
-			end
-		end
-	end
-	if not clone.PrimaryPart then
-		local p = Instance.new("Part")
-		p.Name = "Primary"
-		p.Size = Vector3.new(1,1,1)
-		p.Transparency = 1
-		p.CanCollide = false
-		p.Anchored = true
-		p.Parent = clone
-		clone.PrimaryPart = p
-	end
-
-	local mining = def.MiningPower or 1
-	local price  = def.Price or (mining * 5)
-	local income = def.IncomePerSec or math.max(1, math.floor(mining * 0.5))
-	local rarity = def.Rarity or "Common"
-
-	local ownerVal  = Instance.new("StringValue"); ownerVal.Name  = "Owner";        ownerVal.Value  = ownerName; ownerVal.Parent  = clone
-	local powerVal  = Instance.new("IntValue");   powerVal.Name  = "MiningPower";  powerVal.Value  = mining;    powerVal.Parent  = clone
-	local rarityVal = Instance.new("StringValue");rarityVal.Name = "Rarity";       rarityVal.Value = rarity;    rarityVal.Parent = clone
-	local priceVal  = Instance.new("IntValue");   priceVal.Name  = "Price";        priceVal.Value  = price;     priceVal.Parent  = clone
-	local incomeVal = Instance.new("IntValue");   incomeVal.Name = "IncomePerSec"; incomeVal.Value = income;    incomeVal.Parent = clone
-
+	clone.Name = modelName
+	local ownerVal = Instance.new("StringValue"); ownerVal.Name = "Owner"; ownerVal.Value = ownerName or ""; ownerVal.Parent = clone
+	clone.Parent = brainrotsFolder
+	ensurePrimary(clone)
+	if spawnCFrame and clone.PrimaryPart then pcall(function() clone:SetPrimaryPartCFrame(spawnCFrame) end) end
 	return clone
 end
 
-local function storeOriginalTransparencies(model)
-	local meta = { partOrigTransparency = {}, anchoredStates = {}, originalParent = model.Parent }
-	for _, p in ipairs(model:GetDescendants()) do
-		if p:IsA("BasePart") then
-			meta.partOrigTransparency[p] = p.Transparency or 0
-			meta.anchoredStates[p] = p.Anchored
-		end
-	end
-	return meta
-end
-
-local function restoreTransparenciesAndAnchors(meta)
-	if not meta then return false end
-	local ok = true
-	for part, orig in pairs(meta.partOrigTransparency or {}) do
-		if part and part.Parent then
-			local s, e = pcall(function() part.Transparency = orig or 0 end)
-			if not s then ok = false warn(e) end
-		end
-	end
-	for part, anchored in pairs(meta.anchoredStates or {}) do
-		if part and part.Parent then
-			local s, e = pcall(function() part.Anchored = anchored end)
-			if not s then ok = false warn(e) end
-		end
-	end
-	return ok
-end
-
--- Cash-Booster-aware income loop
-local function startIncomeForPlaced(model)
-	if not model or not model.Parent then return end
-	if activeIncome[model] then return end
-	local incomeValObj = model:FindFirstChild("IncomePerSec")
-	local ownerVal = model:FindFirstChild("Owner")
-	if not incomeValObj or not ownerVal then return end
-	local incomePerSec = tonumber(incomeValObj.Value) or 0
-	local ownerName = tostring(ownerVal.Value or "")
-	local conn = {}
-	activeIncome[model] = conn
-	conn.runner = task.spawn(function()
-		while model and model.Parent and activeIncome[model] == conn do
-			if incomePerSec > 0 and ownerName ~= "" then
-				local pl = Players:FindFirstChild(ownerName)
-				if pl and pl:FindFirstChild("leaderstats") and pl.leaderstats:FindFirstChild("Gold") then
-					local boost = pl:GetAttribute("IncomeBoost") or 0 -- z.B. 0.10 für +10 %
-					local mult = 1 + boost
-					pl.leaderstats.Gold.Value += incomePerSec * mult
-				end
-			end
-			task.wait(1)
-		end
-	end)
-end
-local function stopIncomeForPlaced(model)
-	if activeIncome[model] then
-		activeIncome[model] = nil
-	end
-end
-_G.startIncomeForPlaced = startIncomeForPlaced
-
-local function setPromptsToPickup(model)
-	local prompt = ensurePickupPrompt(model)
-	if prompt then
-		prompt.ActionText = "Aufheben"
-		prompt.ObjectText = model.Name
-		safeSetAttribute(prompt, "Price", nil)
-		safeSetAttribute(prompt, "ModelName", model:GetAttribute("ModelName") or model.Name)
-	end
-	attachLabelToModel(model)
-end
-
-local function resolveSlot(plot, slotInstanceOrName)
-	if typeof(slotInstanceOrName) == "Instance" then
-		if slotInstanceOrName:IsA("BasePart") then
-			return slotInstanceOrName, slotInstanceOrName
-		else
-			for _, d in ipairs(slotInstanceOrName:GetDescendants()) do
-				if d:IsA("BasePart") then
-					return d, slotInstanceOrName
-				end
-			end
-		end
-	elseif type(slotInstanceOrName) == "string" then
-		local slotInst = plot and plot:FindFirstChild(slotInstanceOrName)
-		if slotInst then
-			if slotInst:IsA("BasePart") then
-				return slotInst, slotInst
-			else
-				for _, d in ipairs(slotInst:GetDescendants()) do
-					if d:IsA("BasePart") then
-						return d, slotInst
-					end
-				end
+-- Clear previous held model for player (return its representation to Backpack)
+local function clearExistingHeld(player)
+	for _, m in ipairs(heldStorage:GetChildren()) do
+		if m:IsA("Model") then
+			local ownerVal = m:FindFirstChild("Owner")
+			if ownerVal and ownerVal.Value == player.Name then
+				local item = {
+					ModelName = m:GetAttribute("ModelName") or m.Name,
+					Rarity = m:GetAttribute("Rarity") or "Common",
+					IncomePerSec = m:GetAttribute("IncomePerSec") or 0,
+				}
+				-- detach & remove
+				pcall(function() detachModelFromCharacter(m) end)
+				pcall(function() m:Destroy() end)
+				-- ensure player gets a Tool rep so nothing lost
+				pcall(function() giveToolToBackpack(player, item) end)
+				dprint("Cleared previous held model for", player.Name)
+				return
 			end
 		end
 	end
-	return nil, nil
 end
 
--- Immer neues Tool, kein Stacken
-local function giveToolToBackpack(player, item)
-	local backpack = player:FindFirstChild("Backpack")
-	if not backpack then return end
-
-	local tool = Instance.new("Tool")
-	tool.Name = item.ModelName
-	tool.RequiresHandle = false
-	tool.CanBeDropped = false
-	safeSetAttribute(tool, "amount", 1)
-	safeSetAttribute(tool, "rarity", item.Rarity or "Common")
-	safeSetAttribute(tool, "miningPower", item.MiningPower or 0)
-	safeSetAttribute(tool, "incomePerSec", item.IncomePerSec or 0)
-	tool.ToolTip = string.format("%s | Power %s | Income %s/s",
-		item.Rarity or "Common",
-		tostring(item.MiningPower or 0),
-		tostring(item.IncomePerSec or 0)
-	)
-	tool.Parent = backpack
-end
-
--- Entfernt genau ein Tool (kein amount-Stacking)
-local function removeOneTool(player, modelName)
-	local function try(container)
-		if not container then return false end
-		for _, t in ipairs(container:GetChildren()) do
-			if t:IsA("Tool") and t.Name == modelName then
-				t:Destroy()
+-- remove one tool from backpack
+local function removeOneToolFromBackpackByName(player, toolName)
+	local back = player:FindFirstChild("Backpack")
+	if not back then return false end
+	for _, t in ipairs(back:GetChildren()) do
+		if t:IsA("Tool") then
+			local mn = nil
+			pcall(function() mn = (t.GetAttribute and (t:GetAttribute("ModelName") or t.Name)) or t.Name end)
+			if mn == toolName or t.Name == toolName then
+				pcall(function() t:Destroy() end)
 				return true
 			end
 		end
-		return false
 	end
-	if try(player.Character) then return true end
-	return try(player:FindFirstChild("Backpack"))
+	return false
 end
 
-local function resolveModelAndName(argInstance, fallbackName)
-	local model = nil
-	if argInstance then
-		if argInstance:IsA("ProximityPrompt") then
-			local parent = argInstance.Parent
-			if parent and parent:IsA("BasePart") then
-				model = parent.Parent
-			else
-				model = parent
-			end
-		elseif argInstance:IsA("BasePart") then
-			model = argInstance.Parent
-		else
-			model = argInstance
-		end
-	end
-	local modelName = nil
-	if argInstance and argInstance:IsA("ProximityPrompt") then
-		modelName = argInstance:GetAttribute("ModelName")
-	end
-	if not modelName and model and model:IsA("Instance") then
-		modelName = model:GetAttribute("ModelName") or model.Name
-	end
-	if not modelName then
-		modelName = fallbackName
-	end
-	return model, modelName
-end
-
-local function dumpSlots(plot)
-	if not plot then
-		dprint("PLOT nil")
-		return
-	end
-	dprint("PLOT slots listing for", plot.Name)
-	for _, child in ipairs(plot:GetChildren()) do
-		if type(child.Name) == "string" and child.Name:match("^Slot") then
-			local part = nil
-			if child:IsA("BasePart") then
-				part = child
-			else
-				for _, d in ipairs(child:GetDescendants()) do
-					if d:IsA("BasePart") then
-						part = d
-						break
-					end
+-- PICKUP
+pickupRemote.OnServerEvent:Connect(function(player, targetOrName, modelNameArg)
+	local ok, err = pcall(function()
+		local modelInstance = nil
+		if typeof(targetOrName) == "Instance" then
+			local inst = targetOrName
+			if inst:IsA("ProximityPrompt") then
+				if inst.Parent and inst.Parent:IsA("BasePart") and inst.Parent.Parent then modelInstance = inst.Parent.Parent else modelInstance = inst.Parent end
+			elseif inst:IsA("Model") then modelInstance = inst
+			elseif inst:IsA("BasePart") then modelInstance = inst.Parent
+			else modelInstance = inst:FindFirstAncestorOfClass("Model") end
+		elseif type(targetOrName) == "string" and type(modelNameArg) == "string" then
+			for _, m in ipairs(brainrotsFolder:GetChildren()) do
+				if m:IsA("Model") and m.Name == modelNameArg then
+					local ownerVal = m:FindFirstChild("Owner")
+					if ownerVal and ownerVal.Value == player.Name then modelInstance = m; break end
 				end
 			end
-			dprint(
-				"  Slot", child.Name,
-				"part", part and part:GetFullName() or "nil",
-				"occ(model)", child:GetAttribute("Occupied"),
-				"occ(part)", part and part:GetAttribute("Occupied")
-			)
 		end
-	end
-end
 
-pickupRemote.OnServerEvent:Connect(function(player, targetOrName, nameFromClient)
-	dprint("PICKUP call", player.Name, targetOrName, nameFromClient)
-	local uid = player.UserId
-	if heldByPlayer[uid] then
-		pickupRemote:FireClient(player, false, "Du hältst bereits ein Brainrot.")
-		return
-	end
+		if not modelInstance or not modelInstance:IsA("Model") then pickupRemote:FireClient(player, false, "Ungültiges Ziel."); return end
+		local ownerVal = modelInstance:FindFirstChild("Owner")
+		if not ownerVal or tostring(ownerVal.Value) ~= player.Name then pickupRemote:FireClient(player, false, "Nicht dein Modell."); return end
 
-	-- Pickup placed: immer ins Inventar (StoredInSlot erforderlich)
-	if typeof(targetOrName) == "Instance" then
-		local modelCandidate = targetOrName
-		if modelCandidate:IsA("ProximityPrompt") then
-			modelCandidate = select(1, resolveModelAndName(modelCandidate))
-		end
-		if modelCandidate and modelCandidate:IsDescendantOf(brainrotsFolder) and modelCandidate:FindFirstChild("StoredInSlot") then
-			local owner = modelCandidate:FindFirstChild("Owner")
-			if not owner then
-				owner = Instance.new("StringValue")
-				owner.Name = "Owner"
-				owner.Parent = modelCandidate
-				owner.Value = player.Name
-			elseif owner.Value ~= player.Name then
-				pickupRemote:FireClient(player, false, "Nicht dein Brainrot.")
-				return
+		local item = {
+			ModelName = modelInstance:GetAttribute("ModelName") or modelInstance.Name,
+			Rarity = modelInstance:GetAttribute("Rarity") or "Common",
+			MiningPower = modelInstance:GetAttribute("MiningPower") or 0,
+			IncomePerSec = modelInstance:GetAttribute("IncomePerSec") or 0,
+		}
+
+		local usedInventory = false
+		pcall(function()
+			if not Inventory then tryRequireInventory() end
+			if Inventory and type(Inventory.AddToInventory) == "function" then
+				dprint("Pickup: using Inventory:AddToInventory for", player.Name, item.ModelName)
+				Inventory:AddToInventory(player, item)
+				usedInventory = true
 			end
+		end)
 
-			local stored = modelCandidate:FindFirstChild("StoredInSlot")
-			if stored and stored.Value and stored.Value ~= "" then
-				local plotsFolder = workspace:FindFirstChild("Plots")
-				if plotsFolder then
-					for _, plot in ipairs(plotsFolder:GetChildren()) do
-						local slotObj = plot:FindFirstChild(stored.Value)
-						if slotObj and slotObj.SetAttribute then
-							slotObj:SetAttribute("Occupied", nil)
+		-- ensure UI compatibility: create backpack tool representation if needed
+		pcall(function() giveToolToBackpack(player, item) end)
+
+		pcall(function() modelInstance:Destroy() end)
+
+		dprint("After pickup, backpack:", dumpBackpackContents(player))
+		pickupRemote:FireClient(player, true, "pickedUp")
+		dprint(player.Name .. " picked up " .. tostring(item.ModelName) .. " usedInventory=" .. tostring(usedInventory))
+	end)
+	if not ok then dprint("pickup error:", err); pickupRemote:FireClient(player, false, "Fehler beim Aufheben.") end
+end)
+
+-- EQUIP: spawn workspace model, attach to hand server-side
+equipReq.OnServerEvent:Connect(function(player, inventoryIndexOrModelName)
+	local ok, err = pcall(function()
+		local arg = inventoryIndexOrModelName
+		dprint("Equip request from", player.Name, "arg=", tostring(arg))
+
+		-- clear previous held model first
+		clearExistingHeld(player)
+
+		-- If client passed model name (string)
+		if type(arg) == "string" and arg ~= "" then
+			local modelName = arg
+			-- try remove from Inventory if present
+			pcall(function()
+				if not Inventory then tryRequireInventory() end
+				if Inventory and type(Inventory.GetInventory) == "function" then
+					local inv = Inventory:GetInventory(player) or {}
+					for i = 1, #inv do
+						local itm = inv[i]
+						if itm and (itm.ModelName == modelName or itm.Model == modelName) then
+							pcall(function() Inventory:RemoveFromInventory(player, i) end)
 							break
 						end
 					end
 				end
-				pcall(function() stored:Destroy() end)
-			end
-
-			stopIncomeForPlaced(modelCandidate)
-
-			local modelName = modelCandidate:GetAttribute("ModelName") or modelCandidate.Name
-			local def = Catalog[modelName] or {}
-			local item = {
-				ModelName    = modelName,
-				Rarity       = def.Rarity or (modelCandidate:FindFirstChild("Rarity") and modelCandidate.Rarity.Value) or "Common",
-				MiningPower  = def.MiningPower or (modelCandidate:FindFirstChild("MiningPower") and modelCandidate.MiningPower.Value) or 0,
-				IncomePerSec = def.IncomePerSec or (modelCandidate:FindFirstChild("IncomePerSec") and modelCandidate.IncomePerSec.Value) or 0,
-			}
-
-			local addedOk = pcall(function()
-				Inventory:AddToInventory(player, item)
 			end)
-			if not addedOk then
-				pickupRemote:FireClient(player, false, "Fehler beim Hinzufügen zum Inventar.")
+			-- remove backpack tool if exists
+			pcall(function() removeOneToolFromBackpackByName(player, modelName) end)
+
+			local spawned = spawnModelByName(modelName, player.Name, CFrame.new(0,5,0))
+			if spawned then
+				spawned.Parent = heldStorage
+				ensurePrimary(spawned)
+				attachModelToCharacter(spawned, player)
+				equipResp:FireClient(player, true, spawned)
+				return
+			else
+				equipResp:FireClient(player, false, "Kann Modell nicht spawnen: " .. tostring(modelName))
 				return
 			end
-			giveToolToBackpack(player, item)
-			pcall(function() modelCandidate:Destroy() end)
-
-			pickupRemote:FireClient(player, true, "addedToInventory")
-			dprint(player.Name .. " picked up placed " .. modelName .. " -> inventory")
-			return
-		end
-	end
-
-	-- Purchase (nur ohne StoredInSlot)
-	local modelFromInstance, modelNameFromInstance = nil, nil
-	if typeof(targetOrName) == "Instance" then
-		modelFromInstance, modelNameFromInstance = resolveModelAndName(targetOrName, nameFromClient)
-	end
-	local modelName = modelNameFromInstance or nameFromClient or tostring(targetOrName or "")
-	if not modelName or modelName == "" then
-		pickupRemote:FireClient(player, false, "Ungültiges Ziel.")
-		return
-	end
-
-	local def = Catalog[modelName] or {}
-	local leaderstats = player:FindFirstChild("leaderstats")
-	local gold = leaderstats and leaderstats:FindFirstChild("Gold")
-
-	local cost = 0
-	if def and def.Price then
-		cost = def.Price
-	elseif def and def.MiningPower then
-		local mp = tonumber(def.MiningPower) or def.MiningPower or 0
-		cost = tonumber(mp) * 5
-	else
-		cost = 0
-	end
-
-	if cost <= 0 then
-		pickupRemote:FireClient(player, false, "Nicht kaufbar.")
-		return
-	end
-
-	if not gold then
-		pickupRemote:FireClient(player, false, "Fehlende Daten.")
-		return
-	end
-	if gold.Value < cost then
-		pickupRemote:FireClient(player, false, "Brauchst " .. tostring(cost) .. " Gold!")
-		return
-	end
-
-	gold.Value = gold.Value - cost
-
-	local item = {
-		ModelName    = modelName,
-		Rarity       = def.Rarity or "Common",
-		MiningPower  = def.MiningPower or 0,
-		IncomePerSec = def.IncomePerSec or 0,
-	}
-
-	local addedOk, err = pcall(function()
-		Inventory:AddToInventory(player, item)
-	end)
-	if not addedOk then
-		pickupRemote:FireClient(player, false, "Fehler beim Hinzufügen zum Inventar.")
-		return
-	end
-
-	giveToolToBackpack(player, item)
-
-	if modelFromInstance and modelFromInstance.Parent then
-		pcall(function() modelFromInstance:Destroy() end)
-	end
-
-	pickupRemote:FireClient(player, true, "addedToInventory")
-	dprint("BUY:", player.Name, "model", modelName, "cost", cost)
-end)
-
-local function handlePlace(player, slotInstanceOrName)
-	dprint("PLACE call from", player.Name, "raw arg:", slotInstanceOrName)
-
-	local uid = player.UserId
-	local lastPlace = placeCooldown[uid] or 0
-	if tick() - lastPlace < PLACE_COOLDOWN_SEC then
-		placeRemote:FireClient(player, false, "Bitte kurz warten.")
-		return
-	end
-	placeCooldown[uid] = tick()
-
-	local plotName = player:GetAttribute("PlotName")
-	if not plotName then
-		placeRemote:FireClient(player, false, "Kein Plot gefunden.")
-		return
-	end
-	local plotsFolder = workspace:FindFirstChild("Plots")
-	if not plotsFolder then
-		placeRemote:FireClient(player, false, "Plots nicht verfügbar.")
-		return
-	end
-	local plot = plotsFolder:FindFirstChild(plotName)
-	if not plot then
-		placeRemote:FireClient(player, false, "Plot nicht gefunden.")
-		return
-	end
-
-	dumpSlots(plot)
-
-	local slotPart, slotContainer = resolveSlot(plot, slotInstanceOrName)
-	if not slotPart then
-		placeRemote:FireClient(player, false, "Slot nicht gefunden.")
-		dprint("PLACE fail: no slotPart", slotInstanceOrName)
-		return
-	end
-
-	local occupied = false
-	if slotPart.GetAttribute and slotPart:GetAttribute("Occupied") then occupied = true end
-	if slotContainer and slotContainer ~= slotPart and slotContainer.GetAttribute and slotContainer:GetAttribute("Occupied") then occupied = true end
-	if occupied then
-		placeRemote:FireClient(player, false, "Slot bereits belegt.")
-		dprint("PLACE fail: occupied", slotPart, slotContainer)
-		return
-	end
-
-	-- Fall A: held-Model vorhanden
-	local held = heldByPlayer[uid]
-	if held and held.model then
-		local model = held.model
-		local meta = held.meta
-		pcall(function() restoreTransparenciesAndAnchors(meta) end)
-
-		if slotPart:IsA("BasePart") and model.PrimaryPart then
-			model:SetPrimaryPartCFrame(slotPart.CFrame * CFrame.new(0, 3, 0))
-		elseif slotPart:IsA("BasePart") then
-			for _, p in ipairs(model:GetDescendants()) do
-				if p:IsA("BasePart") then
-					p.CFrame = slotPart.CFrame * CFrame.new(0, 3, 0)
-					break
-				end
-			end
 		end
 
-		for _, part in ipairs(model:GetDescendants()) do
-			if part:IsA("BasePart") then
-				part.Anchored = true
-			end
-		end
-
-		model.Parent = brainrotsFolder
-		setPromptsToPickup(model)
-		attachLabelToModel(model)
-
-		local stored = model:FindFirstChild("StoredInSlot") or Instance.new("StringValue")
-		stored.Name = "StoredInSlot"
-		stored.Value = slotContainer.Name
-		stored.Parent = model
-
-		local ownerTag = model:FindFirstChild("Owner") or Instance.new("StringValue")
-		ownerTag.Name = "Owner"
-		ownerTag.Value = player.Name
-		ownerTag.Parent = model
-
-		if slotPart.SetAttribute then slotPart:SetAttribute("Occupied", true) end
-		if slotContainer and slotContainer ~= slotPart and slotContainer.SetAttribute then
-			slotContainer:SetAttribute("Occupied", true)
-		end
-
-		heldByPlayer[uid] = nil
-		pcall(function() startIncomeForPlaced(model) end)
-
-		placeRemote:FireClient(player, true, tostring(model.Name))
-		dprint("PLACE held OK", model.Name, "at", slotContainer.Name)
-		return
-	end
-
-	-- Fall B: ausgerüstetes Tool klonen ODER eines aus dem Backpack nehmen
-	local char = player.Character
-	local equippedName = nil
-	if char then
-		for _, t in ipairs(char:GetChildren()) do
-			if t:IsA("Tool") then
-				equippedName = t.Name
-				break
-			end
-		end
-	end
-	if not equippedName then
-		local backpack = player:FindFirstChild("Backpack")
-		if backpack then
-			for _, t in ipairs(backpack:GetChildren()) do
+		-- fallback: use first suitable tool in backpack
+		local back = player:FindFirstChild("Backpack")
+		if back then
+			for _, t in ipairs(back:GetChildren()) do
 				if t:IsA("Tool") then
-					equippedName = t.Name
-					break
+					local mn = nil
+					pcall(function() mn = (t.GetAttribute and (t:GetAttribute("ModelName") or t.Name)) or t.Name end)
+					if mn then
+						local folder = ReplicatedStorage:FindFirstChild("BrainrotModels")
+						if folder and folder:FindFirstChild(mn) then
+							pcall(function() t:Destroy() end)
+							local spawned = spawnModelByName(mn, player.Name, CFrame.new(0,5,0))
+							if spawned then
+								spawned.Parent = heldStorage
+								ensurePrimary(spawned)
+								attachModelToCharacter(spawned, player)
+								equipResp:FireClient(player, true, spawned)
+								return
+							end
+						end
+					end
 				end
 			end
 		end
-	end
-	if not equippedName then
-		placeRemote:FireClient(player, false, "Du hast nichts ausgerüstet.")
-		dprint("PLACE fail: no equipped tool (none in char/backpack)")
-		return
-	end
 
-	local newModel = spawnFromCatalog(equippedName, player.Name)
-	if not newModel then
-		placeRemote:FireClient(player, false, "Konnte Modell nicht erzeugen.")
-		dprint("PLACE fail: no template", equippedName)
-		return
-	end
+		equipResp:FireClient(player, false, "No equipable item found")
+		dprint("Equip failed for", player.Name)
+	end)
+	if not ok then dprint("equip error:", err); equipResp:FireClient(player, false, "Server equip error") end
+end)
 
-	if slotPart:IsA("BasePart") and newModel.PrimaryPart then
-		newModel:SetPrimaryPartCFrame(slotPart.CFrame * CFrame.new(0, 3, 0))
-	elseif slotPart:IsA("BasePart") then
-		for _, p in ipairs(newModel:GetDescendants()) do
-			if p:IsA("BasePart") then
-				p.CFrame = slotPart.CFrame * CFrame.new(0, 3, 0)
-				break
+-- PLACE handler: detach weld, restore parts, anchor & finalize
+local function handlePlace(player, slotArg, forcedModelName)
+	local function reply(ok, msg) placeRemote:FireClient(player, ok, msg) end
+
+	dprint("handlePlace called by", player.Name, "slotArg=", tostring(slotArg), "forcedModelName=", tostring(forcedModelName))
+	dprint("Backpack before place:", dumpBackpackContents(player))
+
+	-- resolve plot & slot
+	local plotName = player:GetAttribute("PlotName")
+	if not plotName then reply(false, "Plot nicht gefunden."); return end
+	local plotsFolder = Workspace:FindFirstChild("Plots")
+	if not plotsFolder then reply(false, "Plots fehlen."); return end
+	local plot = plotsFolder:FindFirstChild(plotName)
+	if not plot then reply(false, "Plot nicht in Workspace."); return end
+
+	local slot = nil
+	if typeof(slotArg) == "Instance" then slot = slotArg
+	elseif type(slotArg) == "string" then slot = plot:FindFirstChild(slotArg) end
+	if not slot then reply(false, "Slot nicht gefunden."); return end
+
+	-- occupancy check
+	for _, mod in ipairs(brainrotsFolder:GetChildren()) do
+		if mod:IsA("Model") then
+			local s = mod:FindFirstChild("StoredInSlot")
+			local ownerVal = mod:FindFirstChild("Owner")
+			if s and ownerVal and ownerVal.Value == player.Name and s.Value == slot.Name then
+				reply(false, "Slot bereits belegt.")
+				return
 			end
 		end
 	end
 
-	for _, part in ipairs(newModel:GetDescendants()) do
-		if part:IsA("BasePart") then
-			part.Anchored = true
-		end
-	end
+	local spawnPos = (slot.Position and (slot.Position + Vector3.new(0,3,0))) or Vector3.new(0,5,0)
+	local placedModel = nil
 
-	newModel.Parent = brainrotsFolder
-	setPromptsToPickup(newModel)
-	attachLabelToModel(newModel)
-
-	local stored2 = newModel:FindFirstChild("StoredInSlot")
-	if not stored2 then
-		stored2 = Instance.new("StringValue")
-		stored2.Name = "StoredInSlot"
-		stored2.Parent = newModel
-	end
-	stored2.Value = slotContainer.Name
-
-	local ownerTag2 = newModel:FindFirstChild("Owner")
-	if not ownerTag2 then
-		ownerTag2 = Instance.new("StringValue")
-		ownerTag2.Name = "Owner"
-		ownerTag2.Parent = newModel
-	end
-	ownerTag2.Value = player.Name
-
-	if slotPart.SetAttribute then slotPart:SetAttribute("Occupied", true) end
-	if slotContainer and slotContainer ~= slotPart and slotContainer.SetAttribute then
-		slotContainer:SetAttribute("Occupied", true)
-	end
-
-	removeOneTool(player, equippedName)
-	pcall(function() startIncomeForPlaced(newModel) end)
-
-	placeRemote:FireClient(player, true, tostring(newModel.Name))
-	dprint("PLACE equipped OK", newModel.Name, "at", slotContainer.Name)
-end  -- Ende handlePlace
-
-placeRemote.OnServerEvent:Connect(function(player, slotInstanceOrName)
-	handlePlace(player, slotInstanceOrName)
-end)
-
-local function connectSlotClickDetector(cd)
-	if cd:GetAttribute("SlotClickHooked") then return end
-	cd:SetAttribute("SlotClickHooked", true)
-	cd.MouseClick:Connect(function(player)
-		handlePlace(player, cd.Parent)
-	end)
-end
-
-local function scanSlotsForClickDetectors()
-	local plotsFolder = workspace:FindFirstChild("Plots")
-	if not plotsFolder then return end
-	for _, plot in ipairs(plotsFolder:GetChildren()) do
-		for _, child in ipairs(plot:GetDescendants()) do
-			if child:IsA("ClickDetector") then
-				local parentSlot = child.Parent
-				if parentSlot and type(parentSlot.Name) == "string" and parentSlot.Name:match("^Slot") then
-					connectSlotClickDetector(child)
-				end
-			end
-		end
-	end
-end
-
-scanSlotsForClickDetectors()
-workspace.DescendantAdded:Connect(function(desc)
-	if desc:IsA("ClickDetector") then
-		local parentSlot = desc.Parent
-		if parentSlot and type(parentSlot.Name) == "string" and parentSlot.Name:match("^Slot") then
-			connectSlotClickDetector(desc)
-		end
-	end
-end)
-
-EquipReq_OnServerEvent = equipReq.OnServerEvent:Connect(function(player, inventoryIndex)
-	local ok, result = pcall(function()
-		return Inventory:EquipFromInventory(player, inventoryIndex, heldStorage)
-	end)
-	if ok and result and typeof(result) == "Instance" then
-		heldByPlayer[player.UserId] = { model = result, meta = storeOriginalTransparencies(result) }
-		equipResp:FireClient(player, true, "equipped")
-		dprint("Equip success for", player.Name)
+	if type(forcedModelName) == "string" and forcedModelName ~= "" then
+		pcall(function() removeOneToolFromBackpackByName(player, forcedModelName) end)
+		local spawned = spawnModelByName(forcedModelName, player.Name, CFrame.new(spawnPos))
+		if spawned then placedModel = spawned else reply(false, "Kann Modell nicht spawnen: " .. tostring(forcedModelName)); return end
 	else
-		local err = tostring(result)
-		equipResp:FireClient(player, false, err or "Equip failed")
-		dprint("Equip failed for", player.Name, err)
-	end
-end)
+		-- find held model in heldStorage
+		local heldFound = nil
+		for _, m in ipairs(heldStorage:GetChildren()) do
+			local ownerVal = m:FindFirstChild("Owner")
+			if ownerVal and ownerVal.Value == player.Name then heldFound = m; break end
+		end
 
-local function anchorPlacedModel(model)
-	if not model or not model:IsA("Model") then return end
-	if not model:FindFirstChild("StoredInSlot") then return end
-	for _, part in ipairs(model:GetDescendants()) do
-		if part:IsA("BasePart") then
-			part.Anchored = true
-			part.CanCollide = true
-			part.AssemblyLinearVelocity = Vector3.new(0,0,0)
-			part.AssemblyAngularVelocity = Vector3.new(0,0,0)
+		if heldFound then
+			-- detach weld and restore safe physical state then anchor
+			detachModelFromCharacter(heldFound)
+			placedModel = heldFound
+			pcall(function() placedModel.Parent = brainrotsFolder end)
+			local prim = ensurePrimary(placedModel)
+			if prim then pcall(function() placedModel:SetPrimaryPartCFrame(CFrame.new(spawnPos)) end) end
+			anchorModel(placedModel)
+		else
+			-- fallback: consume a backpack tool
+			local back = player:FindFirstChild("Backpack")
+			local chosenName = nil
+			if back then
+				for _, t in ipairs(back:GetChildren()) do
+					if t:IsA("Tool") then
+						local mn = nil
+						pcall(function() mn = (t.GetAttribute and (t:GetAttribute("ModelName") or t.Name)) or t.Name end)
+						if mn then
+							local folder = ReplicatedStorage:FindFirstChild("BrainrotModels")
+							if folder and folder:FindFirstChild(mn) then
+								chosenName = mn
+								pcall(function() t:Destroy() end)
+								break
+							end
+						end
+					end
+				end
+			end
+			if chosenName then
+				placedModel = spawnModelByName(chosenName, player.Name, CFrame.new(spawnPos))
+				if placedModel then anchorModel(placedModel) end
+			else
+				reply(false, "Kein passendes Item im Rucksack.")
+				return
+			end
 		end
 	end
-	if model.PrimaryPart then
-		model.PrimaryPart.Anchored = true
-		model.PrimaryPart.CanCollide = true
-		model.PrimaryPart.AssemblyLinearVelocity = Vector3.new(0,0,0)
-		model.PrimaryPart.AssemblyAngularVelocity = Vector3.new(0,0,0)
+
+	if placedModel then
+		local s = placedModel:FindFirstChild("StoredInSlot") or Instance.new("StringValue")
+		s.Name = "StoredInSlot"; s.Value = slot.Name; s.Parent = placedModel
+		pcall(function() placedModel:SetAttribute("Yaw", placedModel:GetAttribute("Yaw") or 0) end)
+		if type(_G.startIncomeForPlaced) == "function" then pcall(function() _G.startIncomeForPlaced(placedModel) end) end
+		reply(true, tostring(placedModel.Name))
+		dprint("Placed", tostring(placedModel.Name), "at", slot.Name, "for", player.Name)
+		dprint("Backpack after place:", dumpBackpackContents(player))
+		return
 	end
-	setPromptsToPickup(model)
-	attachLabelToModel(model)
+
+	reply(false, "Platzierung fehlgeschlagen.")
 end
 
-for _, child in ipairs(brainrotsFolder:GetDescendants()) do
-	if child:IsA("Model") then
-		anchorPlacedModel(child)
-	end
-end
-brainrotsFolder.DescendantAdded:Connect(function(child)
-	if child:IsA("Model") then
-		anchorPlacedModel(child)
+placeRemote.OnServerEvent:Connect(function(player, slotArg, forcedModelName)
+	local ok, err = pcall(function() handlePlace(player, slotArg, forcedModelName) end)
+	if not ok then dprint("handlePlace error:", err); placeRemote:FireClient(player, false, "Serverfehler beim Platzieren.") end
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+	-- cleanup held models of leaving player
+	for _, m in ipairs(heldStorage:GetChildren()) do
+		local ownerVal = m:FindFirstChild("Owner")
+		if ownerVal and ownerVal.Value == player.Name then pcall(function() m:Destroy() end) end
 	end
 end)
+
+dprint("BrainrotPickupServer loaded (weld-to-hand behavior enabled, massless safeguards)")
